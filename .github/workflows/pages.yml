@@ -1,5 +1,4 @@
 # Publishes site/ (plain static files, no build step) to GitHub Pages.
-# Untested until this directory is pushed as its own repo with Pages set to "GitHub Actions".
 name: Deploy to GitHub Pages
 on:
   push:
@@ -20,8 +19,6 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-      - name: Include the plan next to the app
-        run: cp PLAN.html site/plan.html
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
