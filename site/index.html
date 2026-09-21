@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Parallelism Explorer</title>
+<meta name="description" content="Explore how tensor / pipeline / data / expert / context parallelism choices change LLM inference throughput, latency and cost on an NVL72 rack.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234257e6'/%3E%3Cpath d='M8 21l5-10 4 7 3-5 4 8' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="side" id="side"></aside>
+  <main class="main" id="main"></main>
+</div>
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true"></aside>
+<div id="tip"></div>
+<div id="errbox"></div>
+<script>
+  // Surface runtime errors on screen while iterating on the mock-up.
+  window.addEventListener('error', (e) => { const b = document.getElementById('errbox'); b.style.display = 'block'; b.textContent += (e.message || e.error) + ' @ ' + (e.filename || '').split('/').pop() + ':' + e.lineno + '\n'; });
+  window.addEventListener('unhandledrejection', (e) => { const b = document.getElementById('errbox'); b.style.display = 'block'; b.textContent += 'Promise: ' + (e.reason && e.reason.stack || e.reason) + '\n'; });
+</script>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
