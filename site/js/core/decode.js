@@ -4,6 +4,7 @@ import { collective, distinctDest } from './comm.js';
 import { memoryPerGpu } from './memory.js';
 
 const eta = (rows, ceil, A) => ceil * rows / (rows + A.gemmHalfM);         // GEMM efficiency rises with rows (small-M penalty)
+const etaAttn = (rows, ceil, A) => ceil * rows / (rows + A.attnHalfM);   // attention efficiency rises with rows too, but saturates much faster than a GEMM (see attnHalfM)
 
 // Expected experts read and max-rank load imbalance for b tokens in the step (PLAN §6.3).
 export function moeLoad(M, P, b) {
@@ -29,7 +30,7 @@ function layerOps(kind, nReq, q, ctx, M, H, W, A, P) {
   // attention core: read the KV cache; absorbed-MLA / GQA / hybrid FLOPs
   { const kvm = D.kv(ctx, P.tpA), Hl = M.heads / P.tpA, by = nReq * kvm.read / P.cp;
     const perTok = M.attn === 'mla' ? 2 * Hl * ctx * (M.kvLora + M.rope + M.kvLora) : M.attn === 'hybrid' ? 4 * Hl * kvm.ent * M.headDim + kvm.idxFl : 4 * Hl * ctx * M.headDim;
-    const fl = perTok * tok / P.cp, peak = H.flops[M.kvDtype === 'bf16' ? 'bf16' : 'fp8'] * A.attnEff, tc = fl / peak, tm = by / bw;
+    const fl = perTok * tok / P.cp, peak = H.flops[M.kvDtype === 'bf16' ? 'bf16' : 'fp8'] * etaAttn(tok, A.attnEff, A), tc = fl / peak, tm = by / bw;
     add('Attention (KV read)', 'kv', fl, by, Math.max(tc, tm), { bound: tc > tm ? 'compute' : 'memory' }); }
   // dense FFN, or shared expert(s) + router in MoE layers
   { const params = (kind === 'moe' ? D.sharedP : D.denseP) / P.tpA + (kind === 'moe' ? D.routerP : 0);      // router is replicated

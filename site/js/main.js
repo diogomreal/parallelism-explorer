@@ -70,9 +70,9 @@ function renderBrand() {
 const numF = (key, label, step) => `<div class="f"><label>${label}</label><input type="number" data-m="${key}" value="${S.model[key]}" step="${step || 1}" min="${key === 'layers' || key === 'hidden' || key === 'heads' ? 1 : 0}"></div>`;
 const selF = (key, label, opts, extra = '') => `<div class="f"><label>${label}</label><select data-ms="${key}" ${extra}>${opts.map(([v, l]) => `<option value="${v}" ${S.model[key] === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>`;
 const DT = [['bf16', 'BF16'], ['fp8', 'FP8'], ['fp4', 'NVFP4']];
-function sliderF(obj, key, label, min, max, step, fmtv, log) {
+function sliderF(obj, key, label, min, max, step, fmtv, log, tip) {
   const v = obj[key];
-  return `<div class="f sl"><label>${label}</label><span class="v" id="v-${obj === S.W ? 'w' : 'a'}-${key}">${fmtv(v)}</span><input type="range" data-${obj === S.W ? 'ws' : 'as'}="${key}" data-log="${log ? 1 : 0}" min="${min}" max="${max}" step="${step}" value="${log ? Math.log2(v) : v}"></div>`;
+  return `<div class="f sl"${tip ? ` data-tip="${esc(tip)}"` : ''}><label>${label}</label><span class="v" id="v-${obj === S.W ? 'w' : 'a'}-${key}">${fmtv(v)}</span><input type="range" data-${obj === S.W ? 'ws' : 'as'}="${key}" data-log="${log ? 1 : 0}" min="${min}" max="${max}" step="${step}" value="${log ? Math.log2(v) : v}"></div>`;
 }
 const sec = (id, title, body) => `<details class="sec" data-sec="${id}" ${S.open[id] ? 'open' : ''}><summary><span class="stt">${title}</span><span class="num" id="sum-${id}"></span></summary><div class="bd">${body}</div></details>`;
 function updateSideSums() {
@@ -102,7 +102,7 @@ function renderSide() {
       ${sliderF(S.A, 'gemmEff', 'GEMM efficiency (peak)', 0.3, 0.95, 0.01, (v) => v.toFixed(2))}
       ${sliderF(S.A, 'moeEff', 'Expert GEMM efficiency', 0.2, 0.95, 0.01, (v) => v.toFixed(2))}
       ${sliderF(S.A, 'hbmEff', 'HBM efficiency', 0.5, 0.98, 0.01, (v) => v.toFixed(2))}
-      ${sliderF(S.A, 'attnEff', 'Attention kernel eff.', 0.15, 0.8, 0.01, (v) => v.toFixed(2))}
+      ${sliderF(S.A, 'attnEff', 'Attention kernel eff.', 0.15, 0.8, 0.01, (v) => v.toFixed(2), false, `This is a ceiling, not a constant: attention-core efficiency ramps up from ~0 toward ${S.A.attnEff.toFixed(2)} as batch size grows, via the same rows/(rows + half-M) curve used for GEMM efficiency — but saturating much faster (half-M = ${S.A.attnHalfM} rows, vs ${S.A.gemmHalfM} for a GEMM), since flash-decoding kernels get extra parallelism from splitting the KV cache that a plain GEMM doesn't. So a batch of 1 already gets most of this ceiling, unlike the GEMM ops.`)}
       ${sliderF(S.A, 'overlap', 'Comm/compute overlap', 0, 1, 0.05, (v) => v.toFixed(2))}
       ${sliderF(S.A, 'alphaUs', 'Collective latency α', 2, 40, 1, (v) => v + ' µs')}
       ${sliderF(S.A, 'overheadMs', 'Per-step framework overhead', 0, 2, 0.05, (v) => v.toFixed(2) + ' ms')}
@@ -171,7 +171,7 @@ function renderParShell() {
     <div class="bd cpar">
       ${modeSeg}${pools}
       ${lgRow('isl', 'Context length', 'tokens', 'Prompt length in tokens. Sets prefill work and the KV each request holds while decoding.')}
-      ${S.poolMode === 'prefill' ? '' : lgRow('batchPerRank', 'Decode batches', '/ rank', 'Decode batch per attention rank: how many requests each attention rank steps together. Total in flight = this × attention-DP ranks × microbatches × replicas.')}
+      ${S.poolMode === 'prefill' ? '' : lgRow('batchPerRank', 'Batches', '/ rank', 'Decode batch per attention rank: how many requests each attention rank steps together. Total in flight = this × attention-DP ranks × microbatches × replicas.')}
       <div class="autorow"><button class="btn sm" id="auto-btn" data-act="auto" data-tip="${esc('Search every valid layout for the highest total throughput that meets your SLOs. If throughput has flattened (the knee), stop at the most interactive point that still keeps ' + Math.round((1 - KNEE_EPS) * 100) + '% of it.')}">Auto-tune</button></div>
       <div class="grp">Stage <em>how the ${split ? 'pool' : 'rack'} is carved up</em></div><div id="sl-pp"></div><div id="sl-replicas"></div><div id="sl-microbatches"></div>
       <div class="grp">Attention <em>TP × DP × CP = GPUs / stage</em></div><div id="sl-tpA"></div><div id="sl-cp"></div>
@@ -391,8 +391,7 @@ document.addEventListener('input', (e) => {
   if (t.dataset.par) {
     const key = t.dataset.par, P = normTarget(), list = SLIDERS[key].list(P.opts);
     S.autoMiss = false;
-    S.par[S.target] = { ...S.par[S.target], [key]: list[+t.value] };
-    if (key === 'pp' && S.par[S.target].microbatches < list[+t.value] && S.par[S.target].microbatches === 1 && list[+t.value] > 1) S.par[S.target].microbatches = Math.min(16, list[+t.value]);
+    S.par[S.target] = { ...S.par[S.target], [key]: list[+t.value] };   // PP and microbatches are independent: raising PP no longer touches your microbatches setting
     S.par[S.target] = pick(normTarget()); updateAll(key); return;
   }
   if (t.dataset.lg) {

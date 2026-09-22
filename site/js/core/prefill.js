@@ -4,11 +4,12 @@ import { collective, distinctDest } from './comm.js';
 import { moeLoad } from './decode.js';
 
 const eta = (rows, ceil, A) => ceil * rows / (rows + A.gemmHalfM);
+const etaAttn = (rows, ceil, A) => ceil * rows / (rows + A.attnHalfM);   // attention saturates much faster than a GEMM (see attnHalfM)
 
 // One layer of one kind for a chunk of `size` tokens per attention rank whose request already has `prior` tokens in the KV cache.
 function layerChunk(kind, size, prior, M, H, A, P) {
   const D = P.D, bw = H.bw * A.hbmEff, tG = size / P.cp;                        // CP shards the chunk's tokens across its ranks
-  const peakW = H.flops[M.wDtype], peakAttn = H.flops[M.kvDtype === 'bf16' ? 'bf16' : 'fp8'] * A.attnEff, Hl = M.heads / P.tpA;
+  const peakW = H.flops[M.wDtype], peakAttn = H.flops[M.kvDtype === 'bf16' ? 'bf16' : 'fp8'] * etaAttn(tG, A.attnEff, A), Hl = M.heads / P.tpA;
   const gemm = (params, rows, peak, ceil) => Math.max(2 * rows * params / (peak * eta(rows, ceil, A)), params * (peak === peakW ? D.bW : D.bE) / bw);
   const tProj = gemm(D.attnP / P.tpA, tG, peakW, A.gemmEff);
   const kvm = D.kv(prior + size / 2, P.tpA);

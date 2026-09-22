@@ -134,18 +134,18 @@ export function prefillC(S, R) {
     <div class="kv tight"><span>KV per request</span><span>${fmt.bytes(pre.kvBytes)}</span><span>Hand-off over NVLink</span><span>${fmt.ms(pre.kvXfer)}</span><span>Same over a 400 Gb/s NIC</span><span>${fmt.ms(pre.kvBytes / 50e9)}</span></div>`,
     { info: 'Prefill is compute-bound: watch the attention share grow with prompt length.' });
 
-  const lens = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const lens = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
   const rows = lens.map((n) => ({ n, r: evalPrefill(M, H, { ...W, isl: n }, A, P, P.gpus) })), base = rows[0].r.tPrefill / 512;
   const ttft = cc('Prefill time vs prompt length', xyChart({
-    w: CW, h: CH, xLog: true, yLog: true, xMin: 512, xMax: 131072, xLabel: 'prompt length (tokens)', yLabel: 'prefill time', margin: { l: 66 }, xFmt: (v) => fmt.n(v, 0), yFmt: (v) => (v >= 1 ? v.toFixed(0) + ' s' : v >= 0.01 ? (v * 1e3).toFixed(0) + ' ms' : (v * 1e3).toFixed(1) + ' ms'),
+    w: CW, h: CH, xLog: true, yLog: true, xMin: 512, xMax: 1048576, xLabel: 'prompt length (tokens)', yLabel: 'prefill time', margin: { l: 66 }, xFmt: (v) => fmt.n(v, 0), yFmt: (v) => (v >= 1 ? v.toFixed(0) + ' s' : v >= 0.01 ? (v * 1e3).toFixed(0) + ' ms' : (v * 1e3).toFixed(1) + ' ms'),
     series: [{ name: 'prefill time', color: 'var(--accent)', pts: rows.map((x) => [x.n, x.r.tPrefill]), dots: true, tips: rows.map((x) => `${fmt.n(x.n, 0)} tokens<br>${fmt.ms(x.r.tPrefill)}`) }, { name: 'if it scaled linearly', color: 'var(--faint)', dash: '5 4', pts: rows.map((x) => [x.n, base * x.n]) }],
     markers: [{ x: Math.max(W.isl, 512), y: pre.tPrefill, color: 'var(--c-comm)', label: 'you' }],
   }), { info: 'The gap between the curves is the quadratic attention term.' });
 
-  const chunks = [1024, 2048, 4096, 8192, 16384, 32768], Wc = { ...W, isl: Math.max(W.isl, 32768) };
+  const chunks = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576], Wc = { ...W, isl: Math.max(W.isl, 1048576) };
   const cr = chunks.map((c) => ({ c, r: evalPrefill(M, H, { ...Wc, chunk: c }, A, P, P.gpus) }));
   const chunk = cc('Chunk size trade-off', xyChart({
-    w: CW, h: CH, rightAxis: true, xLog: true, xMin: 1024, xMax: 32768, xTicks: chunks, xLabel: 'prefill chunk size (tokens)', yLabel: 'input tok/s/GPU', yLabelR: 'time (ms)', xFmt: (v) => fmt.n(v, 0), yFmtR: (v) => fmt.n(v * 1e3, 0),
+    w: CW, h: CH, rightAxis: true, xLog: true, xMin: 1024, xMax: 1048576, xTicks: chunks, xLabel: 'prefill chunk size (tokens)', yLabel: 'input tok/s/GPU', yLabelR: 'time (ms)', xFmt: (v) => fmt.n(v, 0), yFmtR: (v) => fmt.n(v * 1e3, 0),
     series: [{ name: 'throughput', color: 'var(--accent)', pts: cr.map((x) => [x.c, x.r.thr]), dots: true, tips: cr.map((x) => `chunk ${x.c}<br>${fmt.n(x.r.thr, 0)} tok/s/GPU`) }, { name: 'time to prefill', color: 'var(--c-comm)', axis: 'r', pts: cr.map((x) => [x.c, x.r.tPrefill]), dots: true, tips: cr.map((x) => `chunk ${x.c}<br>${fmt.ms(x.r.tPrefill)}`) }],
   }), { info: 'Shown for a ≥32K prompt. Small chunks starve GEMMs and raise the bubble; large chunks delay short prompts queued behind them.' });
   const sched = cc('Chunked pipeline schedule', P.pp > 1 ? gantt({ stages: P.pp, micro: Math.min(pre.nCh, 12), kind: 'prefill', w: CW }) : '<div class="empty">PP = 1 for the prefill pool: no pipeline bubbles. Raise PP to see how chunks flow through stages.</div>', { info: 'Red cells are idle stages (fill and drain).' });
@@ -184,13 +184,13 @@ export function paretoC(S, R) {
 export function sweepsC(S, R) {
   const { M, H, W, A, ev } = R, P = ev.dP;
   const cols = CTX.map((c) => {
-    const mem = memoryPerGpu(M, H, { ...W, isl: c }, A, P, P.D), ba = Math.min(W.batchPerRank, mem.perRankMax);
+    const mem = memoryPerGpu(M, H, { ...W, isl: c }, A, P, P.D), ba = mem.perRankMax;   // batch that saturates HBM at this context, not your slider (which is tuned for one context length and would misrepresent the others)
     if (ba < 1) return { label: ctxLabel(c), v: {}, oom: true, y: 0 };
     const r = evalDecode(M, H, { ...W, isl: c }, A, P, ba), v = {}; r.segs.filter((s) => !s.hidden).forEach((s) => (v[s.key] = s.ms));
-    return { label: ctxLabel(c), v, oom: false, y: mem.bMaxRep, tip: `${ctxLabel(c)} context<br>${fmt.n(mem.bMaxRep, 0)} max concurrent requests<br>TPOT ${fmt.ms(r.tpot)} at batch ${ba}/rank` };
+    return { label: ctxLabel(c), v, oom: false, y: mem.bMaxRep, tip: `${ctxLabel(c)} context<br>${fmt.n(mem.bMaxRep, 0)} max concurrent requests<br>TPOT ${fmt.ms(r.tpot)} at batch ${ba}/rank (HBM-saturating)` };
   });
   const keys = [['attnProj', 'Attn proj'], ['kv', 'Attn core (KV)'], ['dense', 'Dense / shared'], ['moe', 'Experts'], ['comm', 'Comm'], ['pp', 'PP'], ['over', 'Overheads']].map(([key, label]) => ({ key, label, color: COLORS[key] }));
-  const ctx = cc('What limits decode as context grows?', stackedColumns({ cols, keys, w: CW, h: 420, xLabel: 'context length (tokens)', line: { label: 'max concurrent requests', pts: cols.map((c) => ({ y: c.y, tip: c.tip || 'does not fit' })) } }), { info: 'Your current layout, batch capped to fit. Attention / KV eats the step at long context while capacity collapses.' });
+  const ctx = cc('What limits decode as context grows?', stackedColumns({ cols, keys, w: CW, h: 420, xLabel: 'context length (tokens)', line: { label: 'max concurrent requests', pts: cols.map((c) => ({ y: c.y, tip: c.tip || 'does not fit' })) } }), { info: 'Your current layout, batch set to whatever saturates HBM at each context length (independent of the Decode batches slider). Attention / KV eats the step at long context while the batch that fits collapses.' });
 
   const rg = S.regime; let body;
   if (!rg || rg.status !== 'done') body = '<div class="empty"><span class="spinner"></span>&nbsp; Computing the regime map…</div>';

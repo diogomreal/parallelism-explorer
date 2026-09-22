@@ -27,13 +27,14 @@ export const ASSUMP_DEFAULT = {
   gemmEff: 0.6,      // dense GEMM MFU ceiling (fraction of dense peak at large M)
   moeEff: 0.55,      // grouped / expert GEMM efficiency ceiling (relative to peak)
   hbmEff: 0.85,      // achievable fraction of HBM bandwidth
-  attnEff: 0.2,      // attention kernel efficiency (fraction of peak)
+  attnEff: 0.2,      // attention kernel MFU ceiling (fraction of peak); ramped by the same eta()/gemmHalfM row-count curve as gemmEff/moeEff, using batch size as the row count
   overlap: 0.8,      // fraction of the hideable comm actually hidden by dual-batch overlap
   alphaUs: 10,       // base collective latency (per-collective multipliers in comm.js)
   overheadMs: 0.3,   // per-step scheduler / sampling overhead
   memUtil: 0.9,      // gpu-memory-utilization cap
   floorUs: 30,       // per-layer kernel-launch floor with CUDA graphs
   linkEff: 0.7,      // achievable fraction of NVLink bandwidth for all-to-all / p2p
-  gemmHalfM: 24,     // GEMM rows at which efficiency reaches half its ceiling
+  gemmHalfM: 24,     // rows (batch/chunk tokens) at which GEMM efficiency reaches half its ceiling
+  attnHalfM: 4,      // rows at which attention-kernel efficiency reaches half its ceiling: much smaller than gemmHalfM, since flash-decoding kernels get extra parallelism from KV-block splitting that a plain GEMM doesn't, so they saturate at a much smaller batch
 };
 
