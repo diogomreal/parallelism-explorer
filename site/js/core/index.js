@@ -5,6 +5,8 @@ export { divisors, poolGpus, layoutOptions, normalize, expertSlots } from './lay
 export { memoryPerGpu } from './memory.js';
 export { evalDecode, moeLoad } from './decode.js';
 export { evalPrefill } from './prefill.js';
+export { decodeAttention, prefillAttention, attnMathDtype } from './attention.js';
+export { gemmEta } from './gemm.js';
 export { evalAll } from './evaluate.js';
 export { collective, distinctDest } from './comm.js';
 export * from './search.js';

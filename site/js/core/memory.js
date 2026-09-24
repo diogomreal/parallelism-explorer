@@ -13,10 +13,11 @@ export function memoryPerGpu(M, H, W, A, P, D) {
   const wExp = wL(D.moeLayers) * wExpLayers + (mtpLayer && M.moe ? wExpLayers : 0);
   const wEmb = (P.pp === 1 ? 2 : 1) * (M.vocab * M.hidden * D.bW) / P.g;   // vocab-parallel over the stage's GPUs
   const hbm = H.hbmGB * 1e9;
-  const reserved = (1 - A.memUtil) * hbm + 3e9;                    // utilization cap + CUDA graphs + NCCL/NVSHMEM buffers
-  // decode workspace + (for EP) dispatch/combine buffers: ~ EP × 128 tokens × d × (dispatch + combine bytes), 2× buffered
+  // SGLang semantics: --mem-fraction-static (memUtil) of HBM holds weights + KV pool; the rest is left for activations, CUDA graphs, NCCL.
+  const reserved = (1 - A.memUtil) * hbm;
+  // DeepEP dispatch/combine buffers come out of the static pool: ~ EP × 128 tokens × d × (dispatch + combine bytes), 2× buffered
   const disp = M.moe && P.ep > 1 ? 2 * P.ep * 128 * M.hidden * (D.dispatchB + D.combineB) : 0;
-  const act = 2e9 + disp + (P.overlap ? 1e9 : 0);
+  const act = disp;
   const free = Math.max(0, hbm - wAttn - wExp - wEmb - reserved - act);
   const m = Math.max(P.microbatches, 1);
   const kvReq = (D.kv(ctx + 8, P.tpA).store * Ls) / P.cp;          // + half a 16-token page of allocation waste

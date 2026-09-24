@@ -96,7 +96,7 @@ export function pickTop(pts, { objective, slo, minGpu }) {
 
 // Does the winner survive perturbed assumptions? Re-run the top candidates under 8 scenarios (PLAN §8.4).
 export function robustness(M, H, W, A, top, gpus, { objective, slo }, score) {
-  const scenarios = [{ gemmEff: 0.8 }, { gemmEff: 0.52 }, { hbmEff: 0.7 }, { alphaUs: A.alphaUs * 2 }, { overlap: 0 }, { overlap: 1 }, { attnEff: A.attnEff * 0.7 }, { overheadMs: A.overheadMs * 3 }];
+  const scenarios = [{ gemmEff: Math.min(0.95, A.gemmEff * 1.3) }, { gemmEff: A.gemmEff * 0.85 }, { hbmEff: 0.7 }, { alphaUs: A.alphaUs * 2 }, { overlap: 0 }, { overlap: 1 }, { attnEff: A.attnEff * 0.7 }, { overheadMs: A.overheadMs * 3 }];
   let wins = 0;
   if (top.length) scenarios.forEach((sc) => {
     const A2 = { ...A, ...sc };

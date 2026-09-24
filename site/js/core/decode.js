@@ -2,9 +2,8 @@
 // Everything is per GPU, SI units. `ba` = requests per attention rank in one microbatch.
 import { collective, distinctDest } from './comm.js';
 import { memoryPerGpu } from './memory.js';
-
-const eta = (rows, ceil, A) => ceil * rows / (rows + A.gemmHalfM);         // GEMM efficiency rises with rows (small-M penalty)
-const etaAttn = (rows, ceil, A) => ceil * rows / (rows + A.attnHalfM);   // attention efficiency rises with rows too, but saturates much faster than a GEMM (see attnHalfM)
+import { gemmEta as eta } from './gemm.js';
+import { decodeAttention } from './attention.js';
 
 // Expected experts read and max-rank load imbalance for b tokens in the step (PLAN §6.3).
 export function moeLoad(M, P, b) {
@@ -28,10 +27,8 @@ function layerOps(kind, nReq, q, ctx, M, H, W, A, P) {
   { const params = D.attnP / P.tpA, fl = 2 * tok * params, by = params * D.bW, tc = fl / (peakW * eta(tok, A.gemmEff, A)), tm = by / bw;
     add('Attn projections', 'attnProj', fl, by, Math.max(tc, tm), { bound: tc > tm ? 'compute' : 'memory' }); }
   // attention core: read the KV cache; absorbed-MLA / GQA / hybrid FLOPs
-  { const kvm = D.kv(ctx, P.tpA), Hl = M.heads / P.tpA, by = nReq * kvm.read / P.cp;
-    const perTok = M.attn === 'mla' ? 2 * Hl * ctx * (M.kvLora + M.rope + M.kvLora) : M.attn === 'hybrid' ? 4 * Hl * kvm.ent * M.headDim + kvm.idxFl : 4 * Hl * ctx * M.headDim;
-    const fl = perTok * tok / P.cp, peak = H.flops[M.kvDtype === 'bf16' ? 'bf16' : 'fp8'] * etaAttn(tok, A.attnEff, A), tc = fl / peak, tm = by / bw;
-    add('Attention (KV read)', 'kv', fl, by, Math.max(tc, tm), { bound: tc > tm ? 'compute' : 'memory' }); }
+  { const a = decodeAttention(nReq, q, ctx, M, H, A, P);
+    add('Attention (KV read)', 'kv', a.flops, a.bytes, a.t, { bound: a.bound }); }
   // dense FFN, or shared expert(s) + router in MoE layers
   { const params = (kind === 'moe' ? D.sharedP : D.denseP) / P.tpA + (kind === 'moe' ? D.routerP : 0);      // router is replicated
     if (params > 0) { const fl = 2 * tok * params, by = params * D.bW, tc = fl / (peakW * eta(tok, A.gemmEff, A)), tm = by / bw;
@@ -46,13 +43,16 @@ function layerOps(kind, nReq, q, ctx, M, H, W, A, P) {
     const tc = fl / (H.flops[M.expDtype] * eta(Me, A.moeEff, A)), tm = by / bw;
     add('Routed experts', 'moe', fl, by, Math.max(tc, tm), { bound: tc > tm ? 'compute' : 'memory' });
     if (P.ep > 1) {                                                      // dispatch (FP8) + combine (BF16), one send per destination rank
-      const perGpu = b / (P.dpA * P.tpA * P.cp), dest = distinctDest(P.ep, M.topK);
+      const perGpu = b / (P.dpA * P.tpA * P.cp) * load.imb, dest = distinctDest(P.ep, M.topK);   // the hottest receiver sets the all-to-all time
       const Sd = perGpu * dest * M.hidden * D.dispatchB * P.tpM, Sc = perGpu * dest * M.hidden * D.combineB * P.tpM;
       comm.push({ name: 'EP dispatch', kind: 'a2a', n: P.ep, bytes: Sd, t: collective('a2a', Sd, P.ep, H, A) });
       comm.push({ name: 'EP combine', kind: 'a2a', n: P.ep, bytes: Sc, t: collective('a2a', Sc, P.ep, H, A) });
     }
     if (P.tpM > 1) { const S = load.tokLoc * M.hidden * 2; comm.push({ name: 'Expert-TP reduce', kind: 'rs', n: P.tpM, bytes: S, t: collective('rsag', S, P.tpM, H, A) }); }
   }
+  // memory-bound glue kernels (norms, residual adds, activation quantization, RoPE, MoE combine): activation traffic, not weights
+  { const by = (tok * A.glueHid + (load ? load.tokLoc * A.glueExp : 0)) * M.hidden * 2;
+    add('Glue kernels', 'glue', by / 2, by, by / bw, { bound: 'memory' }); }
   if (P.tpA > 1) { const S = tok * M.hidden * 2; comm.push({ name: 'TP all-reduce ×2', kind: 'ar', n: P.tpA, bytes: 2 * S, t: 2 * collective('ar', S, P.tpA, H, A) }); }
   if (P.cp > 1) {                                                        // partial attention output + log-sum-exp across CP ranks
     const v = M.attn === 'mla' ? M.kvLora : M.headDim, S = tok * (M.heads / P.tpA) * (v + 1) * 2;
@@ -109,7 +109,7 @@ export function evalDecode(M, H, W, A, P, ba) {
   const b = ba * P.dpA, thrRep = m * b * E / step, total = thrRep * P.replicas, perGpu = total / P.gpus;
 
   // step-time breakdown per emitted token (ms). Time inside f·t_stage is scaled by m; the (f − m) idle stage-slots are pipeline bubbles.
-  const cats = { attnProj: 0, kv: 0, dense: 0, moe: 0 };
+  const cats = { attnProj: 0, kv: 0, dense: 0, moe: 0, glue: 0 };
   ops.forEach((o) => { cats[o.cat] += o.t * Ls * m / E; });
   const ms = 1e3;
   const segs = [
@@ -117,6 +117,7 @@ export function evalDecode(M, H, W, A, P, ba) {
     { key: 'kv', label: 'Attention core (KV)', ms: cats.kv * ms },
     { key: 'dense', label: 'Dense / shared FFN', ms: cats.dense * ms },
     { key: 'moe', label: 'Routed experts', ms: cats.moe * ms },
+    { key: 'glue', label: 'Glue kernels (norm / quant / residual)', ms: cats.glue * ms },
     { key: 'comm', label: 'Communication (exposed)', ms: exposed * Ls * m / E * ms },
     { key: 'hidden', label: 'Communication (hidden by overlap)', ms: hidden * Ls * m / E * ms, hidden: true },
     { key: 'pp', label: 'PP hops + bubbles', ms: ((f - m) * tStage + P.pp * hop) / E * ms },
@@ -143,6 +144,7 @@ function bottleneck(segs, ops, mem, oom, M) {
     kv: `Attention over the KV cache dominates (${pct}% of the step, ${bound}-bound). More CP/TP shards KV reads; a smaller batch or FP8 KV cuts them.`,
     moe: `Routed experts dominate (${pct}%, ${bound}-bound). ${bound === 'compute' ? 'Experts are past the ridge point: more EP won’t add throughput, only FP4 weights or a smaller batch help.' : 'Expert weights are re-read each step: raise the batch or widen EP so each expert sees more tokens.'}`,
     attnProj: `Attention projections dominate (${pct}%). Weights are replicated per DP-attn rank: increase TP or shrink DP to spread them.`,
+    glue: `Memory-bound glue kernels (norms, quantization, residual adds, MoE combine) dominate (${pct}%): kernel fusion is the lever, not parallelism.`,
     dense: `Dense / shared FFN dominates (${pct}%). Increase TP to multiply bandwidth for these layers.`,
     comm: `Exposed communication dominates (${pct}%). Try dual-batch overlap, fewer TP ranks, or FP8 dispatch.`,
     pp: `Pipeline hops/bubbles dominate (${pct}%). Reduce PP or add microbatches.`,

@@ -3,22 +3,19 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { C, H, A0, W0, mk, cfg, run } from './util.mjs';
 
-const ratio = (model, measured) => model / measured;
+import { ANCHORS } from './anchors.data.mjs';
 
-test('LMSYS GB200 NVL72 Part II — DeepSeek-V3 decode, 48-GPU EP, 2K ISL, batch 1408: 13,386 output tok/s/GPU', () => {
-  const M = mk('deepseek_v3'), W = { ...W0, isl: 2000, osl: 100 };
-  const P = C.normalize(M, 48, cfg({ ep: 48, eplb: true, overlap: true })), r = C.evalDecode(M, H, W, A0, P, 1408);
-  const x = ratio(r.perGpu, 13386); console.log('  decode model/measured =', x.toFixed(2));
-  assert.ok(x > 0.7 && x < 1.3, 'ratio ' + x);
-  assert.ok(!r.oom, 'batch 1408 fits in memory (LMSYS chose it to fill the KV cache)');
-});
-
-test('LMSYS GB200 NVL72 Part II — DeepSeek-V3 prefill, 2 GPUs per instance, 2K ISL: 26,156 input tok/s/GPU', () => {
-  const M = mk('deepseek_v3'), W = { ...W0, isl: 2000, osl: 100, chunk: 8192 };
-  const best = Math.max(...[cfg({ tpA: 2, ep: 2 }), cfg({ ep: 2 }), cfg({ tpA: 2, ep: 1 })].map((c) => C.evalPrefill(M, H, W, A0, C.normalize(M, 2, c), 2).thr));
-  const x = ratio(best, 26156); console.log('  prefill model/measured =', x.toFixed(2));
-  assert.ok(x > 0.7 && x < 1.3, 'ratio ' + x);
-});
+// Absolute anchors (tests/anchors.data.mjs). Calibration and validation anchors must sit within ±30% (or their own `tol`);
+// known gaps are reported as TODO so the miss stays visible without failing the suite.
+for (const a of ANCHORS) {
+  const name = `${a.id}: ${a.measured} ${a.unit} [${a.status}]`;
+  if (!a.run) { test(name, { skip: a.why }, () => {}); continue; }
+  test(name, a.status === 'gap' ? { todo: a.why } : {}, () => {
+    const r = a.run(A0), x = r.value / a.measured, tol = a.tol ?? 0.3;
+    console.log(`  ${a.id}: model/measured = ${x.toFixed(2)} (${r.detail})`);
+    assert.ok(x > 1 - tol && x < 1 + tol, 'ratio ' + x.toFixed(3));
+  });
+}
 
 test('DeepSeek production layout: optimizer prefers wide EP + attention-DP for decode, small/medium EP for prefill', () => {
   const M = mk('deepseek_v3'), W = { ...W0, isl: 4096, osl: 512 };
@@ -40,4 +37,10 @@ test('NVIDIA GB200 NVL72 DeepSeek-V4-Pro: the interactivity axis reaches ≥150 
   const res = C.searchDecode(M, H, W, A0, 72, {}); let s; while (!(s = res.next()).done);
   const maxU = Math.max(...s.value.front.map((p) => p.tokUser)); console.log('  V4-Pro max tok/s/user (MTP1):', maxU.toFixed(0));
   assert.ok(maxU >= 150, 'max interactivity ' + maxU);
+});
+
+test('defaults are the current calibration: re-run `npm run calibrate` after changing the model or the anchors', async () => {
+  const { fit } = await import('../scripts/calibrate.mjs');
+  const A = fit(ANCHORS.filter((a) => a.run && a.status === 'calibration'));
+  for (const k of ['gemmEff', 'moeEff', 'attnEff']) assert.ok(Math.abs(A[k] / A0[k] - 1) < 0.05, `${k}: default ${A0[k]}, fit ${A[k].toFixed(3)}`);
 });

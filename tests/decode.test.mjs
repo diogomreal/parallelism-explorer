@@ -115,3 +115,16 @@ test('all outputs are finite for every preset and pool mode sizes', () => {
     for (const key of ['thr', 'reqPerS', 'tPrefill', 'kvXfer']) assert.ok(Number.isFinite(pre[key]) && pre[key] > 0, `${k} g=${g} prefill ${key}`);
   } }
 });
+
+test('EP all-to-all is sized by the hottest receiving rank (bytes ∝ max-rank load imbalance)', () => {
+  const M = mk('deepseek_v3'), a = dec(M, 72, cfg({ ep: 72 }), 4), b = dec(M, 72, cfg({ ep: 72, eplb: true }), 4);
+  const by = (r) => r.comm.find((c) => c.name === 'EP dispatch').bytes;
+  assert.ok(a.imb > b.imb);
+  near(by(a) / by(b), a.imb / b.imb * (b.ba / a.ba), 1e-9);
+});
+
+test('glue kernels show up as a memory-bound op in decode', () => {
+  const M = mk('deepseek_v3'), r = dec(M, 72, cfg({ ep: 72 }), 256), g = r.ops.find((o) => o.cat === 'glue');
+  assert.ok(g && g.bound === 'memory' && g.t > 0);
+  assert.ok(r.segs.some((s) => s.key === 'glue'));
+});

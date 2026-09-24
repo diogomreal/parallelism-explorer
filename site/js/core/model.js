@@ -5,8 +5,9 @@ export function derive(M) {
   const d = M.hidden, bW = DT_BYTES[M.wDtype], bE = DT_BYTES[M.expDtype], bKV = DT_BYTES[M.kvDtype];
   const dispatchB = DT_BYTES[M.dispatchDtype || 'fp8'], combineB = DT_BYTES[M.combineDtype || 'bf16'];   // EP all-to-all payloads (DeepEP: FP8 dispatch, BF16 combine)
   const L = M.layers, hyb = M.attn === 'hybrid';
-  // hybrid attention (DeepSeek-V4): layer schedule assumed 2 HCA bootstrap layers then alternating CSA / HCA
-  const csaL = hyb ? Math.ceil((L - 2) / 2) : 0, hcaL = hyb ? L - csaL : 0;
+  // hybrid attention (DeepSeek-V4): layer counts from config.json when given, else 2 HCA bootstrap layers then alternating CSA / HCA
+  const swaL = hyb ? M.swaLayers || 0 : 0;
+  const csaL = hyb ? M.csaLayers ?? Math.ceil((L - 2 - swaL) / 2) : 0, hcaL = hyb ? M.hcaLayers ?? L - swaL - csaL : 0;
   const entryB = hyb ? (M.headDim - M.ropeDim) * bKV + M.ropeDim * 2 : 0;     // one compressed KV entry: quantized nope dims + BF16 rope dims
   const idxB = hyb ? M.idxDim * bKV : 0;                                       // one indexer key
   const win = (n) => Math.min(n, M.window);
@@ -36,9 +37,9 @@ export function derive(M) {
   const kv = (n, tpA = 1) => {
     if (hyb) {
       const csaE = win(n) + Math.min(M.idxTopk, n / M.csaRatio), hcaE = win(n) + n / M.hcaRatio;
-      const store = (csaL * ((win(n) + n / M.csaRatio) * entryB + (n / M.csaRatio) * idxB) + hcaL * (win(n) + n / M.hcaRatio) * entryB) / L;
-      const ent = (csaL * csaE + hcaL * hcaE) / L;
-      const read = (csaL * (csaE * entryB + (n / M.csaRatio) * idxB) + hcaL * hcaE * entryB) / L;
+      const store = (csaL * ((win(n) + n / M.csaRatio) * entryB + (n / M.csaRatio) * idxB) + hcaL * (win(n) + n / M.hcaRatio) * entryB + swaL * win(n) * entryB) / L;
+      const ent = (csaL * csaE + hcaL * hcaE + swaL * win(n)) / L;
+      const read = (csaL * (csaE * entryB + (n / M.csaRatio) * idxB) + hcaL * hcaE * entryB + swaL * win(n) * entryB) / L;
       const idxFl = (csaL / L) * 2 * M.idxHeads * M.idxDim * (n / M.csaRatio);
       return { store, read, ent, idxFl };
     }
@@ -47,7 +48,7 @@ export function derive(M) {
   };
   return {
     d, bW, bE, bKV, dispatchB, combineB, attnP, denseP, expertP, moeLayers, denseLayers, sharedP, routedP, routerP, embedP, total, active,
-    kvTokLayer, kv, kvTok: hyb ? (kv(1e6).store * L) / 1e6 : kvTokLayer * L, hyb, csaL, hcaL,
+    kvTokLayer, kv, kvTok: hyb ? (kv(1e6).store * L) / 1e6 : kvTokLayer * L, hyb, csaL, hcaL, swaL,
     mlaFactor: M.attn === 'mla' ? mhaEquiv / (M.kvLora + M.rope) : hyb ? (mhaEquiv * bKV * 1e6) / kv(1e6).store : null,
     sparsity: M.moe ? M.topK / Math.max(M.experts, 1) : 1,
     weightBytes: (total - moeLayers * routedP) * bW + moeLayers * routedP * bE,
