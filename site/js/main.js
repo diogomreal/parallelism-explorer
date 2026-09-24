@@ -52,7 +52,8 @@ function loadHash() {
   try {
     if (!location.hash.slice(1)) return;
     const o = JSON.parse(decodeURIComponent(escape(atob(location.hash.slice(1)))));
-    S.modelKey = o.k; S.model = { ...fullModel(o.k), ...o.m }; S.W = { ...S.W, ...o.w, osl: WORKLOAD_DEFAULT.osl }; delete S.W.prefixHit;   // output length and prefix hit are fixed; ignore them in old links
+    S.modelKey = o.k; S.model = { ...fullModel(o.k), ...o.m }; S.W = { ...S.W, ...o.w, osl: WORKLOAD_DEFAULT.osl };   // output length is fixed; ignore it in old links
+    if (S.W.kvOffload === 'sparse') S.W.kvOffload = 'spill';
      S.A = { ...S.A, ...o.a }; S.split = o.sp; if (o.pm) S.poolMode = o.pm; if (o.cs) S.csub = { ...S.csub, ...o.cs }; S.par = { ...S.par, ...o.par }; S.opt = { ...S.opt, ...o.opt }; S.tab = o.tab || 'decode';
   } catch (e) { /* ignore bad hash */ }
 }
@@ -97,7 +98,7 @@ function renderSide() {
     <div class="derived" id="derived"></div>${M.notes ? `<div class="hint" style="margin-top:8px">${esc(M.notes)}</div>` : ''}`) +
 
   sec('hw', 'Hardware', `
-    <div class="derived"><span>HBM / GPU</span><span>${H.hbmGB} GB</span><span>HBM bandwidth</span><span>${H.bw / 1e12} TB/s</span><span>FP8 dense</span><span>${H.flops.fp8 / 1e15} PF/s</span><span>FP4 dense</span><span>${H.flops.fp4 / 1e15} PF/s</span><span>NVLink / GPU</span><span>${H.link / 1e9} GB/s ea. way</span><span>GPUs</span><span>${H.gpus} (18 trays × 4)</span><span>Rack HBM</span><span>${fmt.bytes(H.hbmGB * 72 * 1e9)}</span></div>
+    <div class="derived"><span>HBM / GPU</span><span>${H.hbmGB} GB</span><span>HBM bandwidth</span><span>${H.bw / 1e12} TB/s</span><span>FP8 dense</span><span>${H.flops.fp8 / 1e15} PF/s</span><span>FP4 dense</span><span>${H.flops.fp4 / 1e15} PF/s</span><span>NVLink / GPU</span><span>${H.link / 1e9} GB/s ea. way</span><span>GPUs</span><span>${H.gpus} (18 trays × 4)</span><span>Grace memory</span><span>${H.host.gbPerGrace} GB / ${H.host.gpusPerGrace} GPUs</span><span>Host link / GPU</span><span>${(Math.min(H.host.c2c, H.host.lpddrBw) / H.host.gpusPerGrace / 1e9).toFixed(0)} GB/s peak</span><span>Rack HBM</span><span>${fmt.bytes(H.hbmGB * 72 * 1e9)}</span></div>
     <details style="margin-top:10px"><summary class="sub-hd" style="cursor:pointer;margin:6px 0">Assumptions <span class="prov">assumed</span></summary>
       ${sliderF(S.A, 'gemmEff', 'GEMM efficiency (peak)', 0.3, 0.95, 0.01, (v) => v.toFixed(2))}
       ${sliderF(S.A, 'moeEff', 'Expert GEMM efficiency', 0.2, 0.95, 0.01, (v) => v.toFixed(2))}
@@ -106,6 +107,11 @@ function renderSide() {
       ${sliderF(S.A, 'attnEffPrefill', 'Attention math eff. (prefill)', 0.3, 1, 0.01, (v) => v.toFixed(2), false, 'Tensor-core efficiency of the prefill (FlashAttention-style) kernel. Prefill attention also pays one softmax exp per score on the SFUs, which on GB200 takes longer than the FP8 matmuls for MLA; together they reproduce LMSYS’s 128K FMHA timings on GB200 and GB300.')}
       ${sliderF(S.A, 'kvBwEff', 'KV streaming bandwidth eff.', 0.4, 1, 0.01, (v) => v.toFixed(2), false, 'Fraction of HBM bandwidth an attention kernel reaches while streaming the KV cache (≈ 0.78 from FlashInfer’s trtllm-gen MLA decode latency vs context). Sets decode speed at long context when attention is memory-bound.')}
       ${sliderF(S.A, 'glueHid', 'Glue passes / token / layer', 0, 30, 1, (v) => v.toFixed(0), false, 'Memory-bound elementwise traffic: how many times each token’s BF16 hidden vector is read or written per layer by norms, residual adds, activation quantization and RoPE (≈ 8 with fused add+RMSNorm). Routed experts add 2 more passes per (token, expert) for the FC2 output and combine.')}
+      ${sliderF(S.A, 'hostGB', 'LPDDR5X for KV / GPU', 0, 240, 10, (v) => v + ' GB', false, 'Each Grace has 480 GB of LPDDR5X shared by its 2 GPUs; OS, runtime and pinned staging buffers take some of it. Caps how much KV the offload modes can place in host memory.')}
+      ${sliderF(S.A, 'hostBwEff', 'Host link efficiency', 0.3, 1, 0.01, (v) => v.toFixed(2), false, `Achieved fraction of the per-GPU host bandwidth, min(C2C, LPDDR5X) / 2 GPUs = ${(Math.min(H.host.c2c, H.host.lpddrBw) / H.host.gpusPerGrace / 1e9).toFixed(0)} GB/s peak. GH200 measures host→device at 416 of 450 GB/s.`)}
+      ${S.model.attn === 'hybrid' ? `${sliderF(S.A, 'sparseBuf', 'Spill: HBM hot buffer / request', 1024, 16384, 512, (v) => v + ' entries', false, 'Sparse-attention spill (SGLang HiSparse): HBM entries kept per request per CSA layer; each step’s top-k entries not in this buffer are swapped in from LPDDR5X. HiSparse uses 2048–6144.')}
+      ${sliderF(S.A, 'sparseMiss', 'Spill: top-k miss rate per step', 0, 0.5, 0.01, (v) => Math.round(v * 100) + '%', false, 'Share of each step’s top-k entries not already in the hot buffer. Adjacent decode steps select largely the same entries (FreeKV: > 80% overlap). No published miss rates for DeepSeek-V4: assumed.')}` : ''}
+      ${sliderF(S.A, 'storageGBs', 'Storage tier bandwidth / GPU', 1, 100, 1, (v) => v + ' GB/s', false, 'Read bandwidth per GPU from the network or NVMe tier (3FS, Mooncake, Dynamo KVBM disk) when prefix-cache hits come from storage.')}
       ${sliderF(S.A, 'overlap', 'Comm/compute overlap', 0, 1, 0.05, (v) => v.toFixed(2))}
       ${sliderF(S.A, 'alphaUs', 'Collective latency α', 2, 40, 1, (v) => v + ' µs')}
       ${sliderF(S.A, 'overheadMs', 'Per-step framework overhead', 0, 2, 0.05, (v) => v.toFixed(2) + ' ms')}
@@ -123,7 +129,10 @@ function renderSide() {
     <div class="sub-hd">Speculative decoding</div>
     <div class="f"><label>Draft tokens per step (γ)</label><input type="number" data-w="specGamma" value="${S.W.specGamma}" step="1" min="0" max="6"></div>
     ${sliderF(S.W, 'specAlpha', 'Acceptance rate (α)', 0.3, 0.99, 0.01, (v) => v.toFixed(2))}
-    <div class="hint">γ = 0 turns it off. Uses the model’s MTP layer (one full layer, run γ times) to draft; the target verifies γ+1 tokens per step.</div>`);
+    <div class="hint">γ = 0 turns it off. Uses the model’s MTP layer (one full layer, run γ times) to draft; the target verifies γ+1 tokens per step.</div>
+    <div class="sub-hd">Prefix cache</div>
+    ${sliderF(S.W, 'prefixHit', 'Prefix cache hit', 0, 0.95, 0.05, (v) => Math.round(v * 100) + '%', false, 'Share of each prompt whose KV is already cached (multi-turn chat, agents, shared documents). Those tokens skip prefill compute; their KV is loaded into HBM layer by layer while the rest of the prompt computes, as SGLang HiCache and NVIDIA Dynamo KVBM do. 0% turns the prefix cache off.')}
+    <div class="f"><label>Prefix cache lives in</label><select id="w-prefixTier" data-wsel="prefixTier" ${S.W.prefixHit > 0 ? '' : 'disabled'}>${[['host', 'Grace LPDDR5X'], ['storage', 'Network / NVMe storage']].map(([v, l]) => `<option value="${v}" ${S.W.prefixTier === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>`);
   updateDerived(); updateSideSums();
 }
 function updateDerived() {
@@ -169,6 +178,9 @@ function renderParShell() {
   const toggles = `<div class="togs">
         <label class="tog" data-tip="Two microbatches ping-pong so one's all-to-all hides behind the other's compute."><input type="checkbox" data-opt="dbo" ${S.opt.dbo ? 'checked' : ''}><i></i>Dual-batch overlap</label>
         ${M.moe ? `<label class="tog" data-tip="Expert-parallel load balancer with redundant hot experts."><input type="checkbox" data-opt="eplb" ${S.opt.eplb ? 'checked' : ''}><i></i>EPLB</label>` : ''}</div>`;
+  const decodePool = S.poolMode === 'decode' || (split && S.target === 'decode');
+  const kvPlace = decodePool ? `<div class="grp">KV cache <em>where decode KV lives</em></div>
+      <div class="seg2 full kvseg" role="radiogroup" aria-label="Decode KV placement">${[['none', 'HBM only'], ['spill', 'Spill to LPDDR5X when HBM is full']].map(([v, l]) => `<button data-act="kvplace" data-v="${v}" role="radio" aria-checked="${S.W.kvOffload === v}" class="${S.W.kvOffload === v ? 'on' : ''}">${l}</button>`).join('')}</div>` : '';
   $('#parcard').innerHTML = `
     <div class="hd"><h3>Parallelism</h3><span class="muted" style="font-size:12px;margin-left:auto">GPUs / stage / replica <b class="mono" id="gper"></b></span></div>
     <div class="bd cpar">
@@ -179,7 +191,7 @@ function renderParShell() {
       <div class="grp">Stage <em>how the ${split ? 'pool' : 'rack'} is carved up</em></div><div id="sl-pp"></div><div id="sl-replicas"></div><div id="sl-microbatches"></div>
       <div class="grp">Attention <em>TP × DP × CP = GPUs / stage</em></div><div id="sl-tpA"></div><div id="sl-cp"></div>
       <div class="grp">${M.moe ? 'MoE <em>EP × TP<sub>moe</sub> = GPUs / stage</em>' : 'FFN <em>dense: follows attention TP</em>'}</div>${M.moe ? '<div id="sl-ep"></div>' : ''}
-      ${toggles}<div class="notes" id="par-notes"></div>
+      ${toggles}${kvPlace}<div class="notes" id="par-notes"></div>
     </div>`;
   updateParPieces();
 }
@@ -216,7 +228,7 @@ function renderKpis() {
       kpi('reqs', 'Prefill rate', fmt.n(pre.reqPerS, 1), 'req/s', `prompts of ${fmt.n(pre.isl, 0)} tokens`) +
       kpi('bubble', 'Pipeline bubble', fmt.pct(pre.bubble), '', ev.pP.pp > 1 ? `PP${ev.pP.pp} · ${pre.nCh} chunks` : 'PP = 1: none') + cost;
     const top = [...pre.segs].filter((x) => !x.hidden).sort((a, b) => b.ms - a.ms)[0], tot = pre.segs.filter((x) => !x.hidden).reduce((a, x) => a + x.ms, 0), pct = Math.round((top.ms / tot) * 100);
-    const why = { attnProj: 'Linear projections dominate: prefill is compute-bound, so throughput tracks GEMM efficiency. FP8 attention weights or more replicas raise it.', moe: 'Routed experts dominate: compute-bound expert GEMMs. FP4 experts, a wider EP or less padding raise throughput.', kv: 'Attention over the prompt dominates: quadratic in prompt length. More CP, prefix caching or a sparser attention pattern help.', glue: 'Memory-bound glue kernels (norms, quantization, residual adds, MoE combine) dominate: fusion is the lever.', comm: 'Exposed communication dominates. Try dual-batch overlap or a narrower EP / TP.', pp: 'Pipeline fill and drain dominate: use more chunks per prompt or less PP.' }[top.key];
+    const why = { attnProj: 'Linear projections dominate: prefill is compute-bound, so throughput tracks GEMM efficiency. FP8 attention weights or more replicas raise it.', moe: 'Routed experts dominate: compute-bound expert GEMMs. FP4 experts, a wider EP or less padding raise throughput.', kv: 'Attention over the prompt dominates: quadratic in prompt length. More CP, prefix caching or a sparser attention pattern help.', glue: 'Memory-bound glue kernels (norms, quantization, residual adds, MoE combine) dominate: fusion is the lever.', host: 'Loading cached prefix KV dominates: the cache tier is slower than the compute it saves. Move the cache to Grace memory or lower the hit share served from storage.', comm: 'Exposed communication dominates. Try dual-batch overlap or a narrower EP / TP.', pp: 'Pipeline fill and drain dominate: use more chunks per prompt or less PP.' }[top.key];
     banner = { kind: top.key, text: `${top.label} takes ${pct}% of prefill time. ${why}` , ttl: 'Prefill bottleneck' };
   } else {
     const [tv, tu] = ev.ttft != null ? secOrMs(ev.ttft) : [];
@@ -326,12 +338,12 @@ async function runOptimizer() {
   O.running = false; renderPane();
 }
 function applyPoint(p, keepTab) {
-  S.par.decode = pick(p.P); S.opt.dbo = p.cfg.overlap; S.opt.eplb = p.cfg.eplb; S.W.batchPerRank = p.ba; S.target = 'decode';
+  S.par.decode = pick(p.P); S.opt.dbo = p.cfg.overlap; S.opt.eplb = p.cfg.eplb; S.W.batchPerRank = p.ba; S.target = 'decode'; if (p.kv) S.W.kvOffload = p.kv;
   renderSide(); renderParShell(); if (!keepTab) S.tab = 'decode'; updateAll();
 }
 function applySplitRow(row, keepTab) {
   S.split = row.gp; S.par.prefill = pick(row.pre.P); S.par.decode = pick(row.dec.P); S.W.chunk = row.pre.chunk; S.W.batchPerRank = row.dec.ba;
-  S.opt.dbo = row.dec.cfg.overlap; S.opt.eplb = row.dec.cfg.eplb; S.target = 'decode';
+  S.opt.dbo = row.dec.cfg.overlap; S.opt.eplb = row.dec.cfg.eplb; S.target = 'decode'; if (row.dec.kv) S.W.kvOffload = row.dec.kv;
   renderSide(); renderParShell(); scheduleSearch(); if (!keepTab) S.tab = 'decode'; updateAll();
 }
 function applyPrefillRow(row, keepTab) {
@@ -409,8 +421,10 @@ document.addEventListener('input', (e) => {
   if (t.dataset.split) { S.split = +t.value; renormPars(); updateAll(); scheduleSearch(); return; }
   if (t.dataset.m) { S.model[t.dataset.m] = num(t); S.modelKey = S.modelKey; renormPars(); updateDerived(); updateAll(); scheduleSearch(); return; }
   if (t.dataset.w) { if (t.closest('#pane')) return; S.W[t.dataset.w] = num(t); updateAll(); scheduleSearch(); return; }
-  if (t.dataset.ws) { const k = t.dataset.ws, v = t.dataset.log === '1' ? Math.pow(2, +t.value) : +t.value; S.W[k] = v; const lab = $('#v-w-' + k); if (lab) lab.textContent = k === 'specAlpha' ? v.toFixed(2) : Math.round(v); updateAll(); scheduleSearch(); return; }
-  if (t.dataset.as) { const k = t.dataset.as; S.A[k] = +t.value; const lab = $('#v-a-' + k); if (lab) lab.textContent = k === 'alphaUs' ? t.value + ' µs' : k === 'overheadMs' ? (+t.value).toFixed(2) + ' ms' : (+t.value).toFixed(2); updateAll(); scheduleSearch(); return; }
+  if (t.dataset.ws) { const k = t.dataset.ws, v = t.dataset.log === '1' ? Math.pow(2, +t.value) : +t.value; S.W[k] = v; const lab = $('#v-w-' + k); if (lab) lab.textContent = k === 'specAlpha' ? v.toFixed(2) : k === 'prefixHit' || k === 'sparseMiss' ? Math.round(v * 100) + '%' : Math.round(v);
+    if (k === 'prefixHit') { const sel = $('#w-prefixTier'); if (sel) sel.disabled = !(v > 0); }
+    updateAll(); scheduleSearch(); return; }
+  if (t.dataset.as) { const k = t.dataset.as; S.A[k] = +t.value; const lab = $('#v-a-' + k); if (lab) lab.textContent = k === 'alphaUs' ? t.value + ' µs' : k === 'overheadMs' ? (+t.value).toFixed(2) + ' ms' : k === 'hostGB' ? t.value + ' GB' : k === 'sparseBuf' ? t.value + ' entries' : k === 'sparseMiss' ? Math.round(t.value * 100) + '%' : k === 'storageGBs' ? t.value + ' GB/s' : k === 'glueHid' ? t.value : (+t.value).toFixed(2); updateAll(); scheduleSearch(); return; }
   if (t.dataset.o) { if (t.type === 'number') return; const k = t.dataset.o; S.optim[k] = t.type === 'checkbox' ? t.checked : t.tagName === 'SELECT' ? t.value : num(t); if (t.tagName === 'SELECT') renderPane(); return; }
 });
 document.addEventListener('change', (e) => {
@@ -420,6 +434,7 @@ document.addEventListener('change', (e) => {
     if (k === 'attn') ensureAttn(S.model);
     if (k === 'moe' && S.model.moe && !(S.model.experts > 0)) Object.assign(S.model, { experts: 64, topK: 4, expertInter: 2048, shared: 0, denseLayers: Math.min(S.model.denseLayers || 1, S.model.layers - 1) }); renormPars(); renderSide(); renderParShell(); scheduleSearch(); updateAll(); return; }
   if (t.dataset.opt) { S.opt[t.dataset.opt] = t.checked; scheduleSearch(); updateAll(); return; }
+  if (t.dataset.wsel) { S.W[t.dataset.wsel] = t.value; renderSide(); scheduleSearch(); updateAll(); return; }
   if (t.dataset.w && t.closest('#pane')) { S.W[t.dataset.w] = num(t); updateAll(); scheduleSearch(); return; }
   if (t.dataset.o && t.type === 'number') { S.optim[t.dataset.o] = num(t); return; }
   if (t.dataset.m) { renderSide(); }
@@ -440,6 +455,7 @@ document.addEventListener('click', (e) => {
   else if (a === 'close') closeDrawer();
   else if (a === 'run-opt') runOptimizer();
   else if (a === 'auto') autoTune();
+  else if (a === 'kvplace') { S.W.kvOffload = v; renderParShell(); scheduleSearch(); updateAll(); }
   else if (a === 'apply-opt') applyPoint(S.optim.results.top[+b.dataset.i]);
   else if (a === 'apply-frontier') applyPoint(S.search.front[+b.dataset.i]);
 });

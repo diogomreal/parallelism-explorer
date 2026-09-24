@@ -3,12 +3,13 @@
 import { xyChart, roofline, stackBar, legendRows, stackedColumns, heatmap, gantt, laneTimeline, fmt, esc } from './charts.js';
 import { evalDecode, evalPrefill, memoryPerGpu, sweepConfig, cfgLabel, family, poolGpus, enumerateConfigs } from './core/index.js';
 
-export const COLORS = { spec: '#2e9fd6', attnProj: 'var(--c-attn)', kv: 'var(--c-kv)', dense: 'var(--c-dense)', moe: 'var(--c-moe)', glue: 'var(--c-glue)', comm: 'var(--c-comm)', hidden: 'var(--c-comm)', pp: 'var(--c-pp)', over: 'var(--c-over)' };
+export const COLORS = { spec: '#2e9fd6', attnProj: 'var(--c-attn)', kv: 'var(--c-kv)', dense: 'var(--c-dense)', moe: 'var(--c-moe)', glue: 'var(--c-glue)', host: 'var(--c-host)', comm: 'var(--c-comm)', hidden: 'var(--c-comm)', pp: 'var(--c-pp)', over: 'var(--c-over)' };
 export const FAM_COLORS = { 'DP-attn + wide EP': '#4f7cf0', 'Small EP groups × replicas': '#17a89a', 'TP + EP': '#f08c2b', 'TP + CP': '#d0629f', 'Deep PP': '#c9a21a' };
 export const FAM_SHORT = { 'DP-attn + wide EP': 'DP·wide-EP', 'Small EP groups × replicas': 'EP×repl', 'TP + EP': 'TP·EP', 'TP + CP': 'TP·CP', 'Deep PP': 'PP' };
 
 export const tagFor = (b) => ({ memory: '<span class="tag bw">HBM-bound</span>', compute: '<span class="tag cmp">compute-bound</span>', latency: '<span class="tag lat">latency-bound</span>', bandwidth: '<span class="tag bw">link-BW-bound</span>' }[b] || '');
 
+const int = (x) => (Math.abs(x) >= 1e4 ? fmt.n(x, 0) : String(Math.round(x)));   // whole counts (requests): no decimals
 export const CTX = [1024, 4096, 16384, 65536, 262144, 1048576];
 export const ctxLabel = (v) => (v >= 1048576 ? '1M' : v >= 1024 ? v / 1024 + 'K' : v);
 export function computeRegime(S, R) {
@@ -48,7 +49,7 @@ export function mathFor(key, S, R) {
   if (key === 'ttft' && S.poolMode === 'prefill') return { title: 'Prefill latency', html: mb('Latency to first token, prefill side', 'latency = t_prefill + KV hand-off', [['prefill', fmt.ms(ev.pre.tPrefill)], (ev.pre.pack > 1 ? ['packed prompts', ev.pre.pack + ' × ' + fmt.n(ev.pre.C, 0) + ' tokens per pass'] : ['chunks', ev.pre.nCh + ' × ' + fmt.n(ev.pre.C, 0)]), ['KV transfer', fmt.ms(ev.pre.kvXfer)]], 'Excludes queueing and the first decode step, which happen on the decode rack.') };
   if (key === 'ttft') return { title: 'Time to first token', html: mb('TTFT', 'TTFT = queueing + prefill + KV hand-off + first decode step', [['prefill', fmt.ms(ev.pre.tPrefill)], (ev.pre.pack > 1 ? ['packed prompts', ev.pre.pack + ' × ' + fmt.n(ev.pre.C, 0) + ' tokens per pass'] : ['chunks', ev.pre.nCh + ' × ' + fmt.n(ev.pre.C, 0)]), ['KV transfer', fmt.ms(ev.pre.kvXfer)], ['first decode step', fmt.ms(dec.tpot)], ['queueing (assumed)', '10 ms']], 'Mean-only in v1; a discrete-event simulator would add queueing and tails.') };
   if (key === 'cost') return { title: 'Cost per million tokens', html: mb(`$ / Mtok ${ev.costUnit}`, `$/Mtok = ($/GPU-hr · 72 / 3600) / (rack ${ev.costUnit} tok/s) · 10⁶`, [['$/GPU-hr', fmt.usd(W.gpuHr)], [`rack ${ev.costUnit} tok/s`, fmt.n((ev.costUnit === 'input' ? ev.pre.thr : ev.outPerGpu) * 72, 0)], ['result', fmt.usd(ev.costPerM)]]) };
-  if (key === 'conc') return { title: 'Concurrency & capacity', html: mb('Max requests per attention rank', 'floor( free HBM / (KV per request per GPU · microbatches) )', [['free HBM', fmt.bytes(dec.mem.free)], ['KV / request / GPU', fmt.bytes(dec.mem.kvReq)], ['microbatches', P.microbatches], ['max / rank', fmt.n(dec.mem.perRankMax, 0)], ['× DP-attn ranks', P.dpA], ['max concurrent (replica)', fmt.n(dec.mem.bMaxRep, 0)]], 'KV per request per GPU = KV bytes at this context · layers per stage, divided by CP (and by TP for GQA). Hybrid CSA/HCA models store one compressed entry per 4 or 128 tokens per layer, plus a 128-token window.') };
+  if (key === 'conc') return { title: 'Concurrency & capacity', html: mb('Max requests per attention rank', { none: 'floor( free HBM / (KV per request per GPU · microbatches) )', spill: 'floor( (free HBM + Grace memory for KV) / (KV per request per GPU · microbatches) )', sparse: 'min( free HBM / HBM per offloaded request, (free HBM + offloadable requests · HBM saved per offload) / KV per request ), ÷ microbatches; offloadable = LPDDR5X / CSA KV per request' }[dec.mem.mode], [['free HBM', fmt.bytes(dec.mem.free)], ['KV / request / GPU', fmt.bytes(dec.mem.kvReq)], ...(dec.mem.mode !== 'none' ? [['Grace memory for KV', fmt.bytes(dec.mem.hostCap)], ['max / rank, HBM alone', int(dec.mem.hbmMax)]] : []), ...(dec.mem.mode === 'sparse' ? [['KV in HBM / request', fmt.bytes(dec.mem.kvDev)], ['KV in host / request', fmt.bytes(dec.mem.kvHost)]] : []), ['microbatches', P.microbatches], ['max / rank', int(dec.mem.perRankMax)], ['× DP-attn ranks', P.dpA], ['max concurrent (replica)', fmt.n(dec.mem.bMaxRep, 0)]], 'KV per request per GPU = KV bytes at this context · layers per stage, divided by CP (and by TP for GQA). Hybrid CSA/HCA models store one compressed entry per 4 or 128 tokens per layer, plus a 128-token window.') };
   if (key === 'mfu') { const fl = dec.ops.reduce((s, o) => s + o.flops, 0) * Ls, by = dec.ops.reduce((s, o) => s + o.bytes, 0) * Ls; return { title: 'Utilization', html: mb('MFU / MBU', 'MFU = FLOPs per stage / (t_stage · peak);  MBU = bytes / (t_stage · HBM BW)', [['FLOPs / stage / GPU', fmt.n(fl)], ['HBM bytes / stage / GPU', fmt.bytes(by)], ['t_stage', fmt.ms(dec.tStage)], ['MFU', fmt.pct(fl / dec.tStage / H.flops[M.wDtype])], ['MBU', fmt.pct(by / dec.tStage / H.bw)]]) }; }
   return { title: 'Details', html: '<p class="muted">Coming soon.</p>' };
 }
@@ -73,7 +74,7 @@ function decodeOverview(S, R) {
     { info: 'Critical path of one decode step (TPOT) for one user. Hover a segment for details.', right: `${bigv(fmt.ms(dec.tpot))}<span class="muted">TPOT · batch ${dec.ba}/rank${dec.E > 1 ? ` · ${dec.E.toFixed(2)} tok/step` : ''}</span>` });
 
   const peak = H.flops[M.wDtype];
-  const pts = dec.ops.map((o) => ({ name: o.name, ai: o.ai, perf: o.flops / o.t, color: COLORS[o.cat], tip: `<b>${o.name}</b><br>AI ${o.ai.toFixed(1)} FLOP/B<br>${fmt.flops(o.flops / o.t)} achieved<br>${o.bound}-bound` }));
+  const pts = dec.ops.filter((o) => o.flops > 0).map((o) => ({ name: o.name, ai: o.ai, perf: o.flops / o.t, color: COLORS[o.cat], tip: `<b>${o.name}</b><br>AI ${o.ai.toFixed(1)} FLOP/B<br>${fmt.flops(o.flops / o.t)} achieved<br>${o.bound}-bound` }));
   const roof = cc('Roofline', roofline({ peak, bw: H.bw * A.hbmEff, peakLabel: `${M.wDtype.toUpperCase()} ${fmt.flops(peak)}`, points: pts, w: CW, h: CH }), { info: 'Per GPU, one decode layer. Each dot is an op. Left of the ridge = memory-bound; right = compute-bound.' });
 
   const grid = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
@@ -91,20 +92,24 @@ function decodeOverview(S, R) {
     markers: [{ x: dec.ba, y: dec.tpot * 1e3, color: 'var(--c-comm)', r: 6, label: 'you' }, { x: dec.ba, y: dec.perGpu, axis: 'r', color: 'var(--accent)', r: 6 }],
   }), { info: 'Bigger batches raise throughput until something saturates: latency grows, and eventually the KV cache no longer fits.' });
 
-  const kvUsed = Math.min(mem.kvUsedFor(dec.ba), Math.max(0, mem.hbm - mem.wAttn - mem.wExp - mem.wEmb - mem.reserved - mem.act));
-  const free = Math.max(0, mem.hbm - mem.wAttn - mem.wExp - mem.wEmb - kvUsed - mem.act - mem.reserved);
+  // What this configuration needs, not capped at what fits: an over-capacity setup shows how far over it is.
+  const usable = mem.hbm - mem.reserved;   // HBM the model may use: the fixed reserve (utilization cap, CUDA graphs, comm buffers) is left out of the bar
+  const kvNeed = mem.kvUsedFor(dec.ba);    // HBM share of this batch's KV (with spill, the rest is in the LPDDR5X row below)
+  const need = mem.wAttn + mem.wExp + mem.wEmb + kvNeed + mem.act, over = Math.max(0, need - usable);
   const ms = [
     { v: mem.wAttn, label: 'Attention / dense weights', color: 'var(--c-attn)' },
     { v: mem.wExp, label: 'Expert weights (+ redundant)', color: 'var(--c-moe)' },
     { v: mem.wEmb, label: 'Embedding / LM head', color: 'var(--c-dense)' },
-    { v: kvUsed, label: 'KV cache in use', color: 'var(--c-kv)' },
+    { v: kvNeed, label: over > 0 ? 'KV cache required' : 'KV cache in use', color: 'var(--c-kv)' },
     { v: mem.act, label: 'Activations & workspace', color: 'var(--c-pp)' },
-    { v: free, label: 'Free', color: 'var(--c-free)' },
   ];
-  const usable = mem.hbm - mem.reserved;   // HBM the model may use: the fixed reserve (utilization cap, CUDA graphs, comm buffers) is left out of the bar
-  const memory = cc('Memory per GPU', `${stackBar(ms, { total: usable, fmtv: fmt.bytes, height: 22, showLabels: false })}${legendRows(ms, usable, fmt.bytes)}
-    <div class="kv tight"><span>Max requests / attention rank</span><span>${fmt.n(mem.perRankMax, 0)}</span><span>Max concurrent (replica)</span><span>${fmt.n(mem.bMaxRep, 0)}</span></div>`,
-    { info: 'Weights left after sharding: attention replicates across DP-attn ranks; experts shard across EP. Bar shows usable HBM: 10% headroom plus ~3 GB of CUDA-graph and communication buffers are already set aside.', right: `${bigv(fmt.bytes(usable - free))}<span class="muted">of ${fmt.bytes(usable)} usable</span>${dec.oom ? '<span class="pill bad">OOM</span>' : ''}` });
+  const tail = over > 0 ? { v: over, label: 'Over capacity', color: 'var(--bad)', hatch: true } : { v: usable - need, label: 'Free', color: 'var(--c-free)' };
+  const bar = over > 0   // past the limit the bar spans what is needed, with a marker where usable HBM ends
+    ? `<div class="memwrap">${stackBar(ms, { total: need, fmtv: fmt.bytes, height: 22, showLabels: false })}<i class="memcap" style="left:${(usable / need) * 100}%" data-tip="Usable HBM: ${fmt.bytes(usable)}"></i></div>`
+    : stackBar([...ms, tail], { total: usable, fmtv: fmt.bytes, height: 22, showLabels: false });
+  const memory = cc('Memory per GPU', `${bar}${legendRows([...ms, tail], usable, fmt.bytes)}
+    <div class="kv tight"><span>Max requests / attention rank</span><span>${int(mem.perRankMax)}${mem.mode !== 'none' ? ` <span class="muted">(HBM alone: ${int(mem.hbmMax)})</span>` : ''}</span><span>Max concurrent (replica)</span><span>${fmt.n(mem.bMaxRep, 0)}</span>${mem.mode !== 'none' ? `<span>LPDDR5X for KV</span><span>${fmt.bytes(mem.hostUsedFor(dec.ba))} of ${fmt.bytes(mem.hostCap)}</span>${mem.mode === 'sparse' ? `<span>Requests with CSA KV in LPDDR5X</span><span>${int(mem.offloadedFor(dec.ba))} of ${int(dec.ba)}</span><span>Offloaded request: HBM / LPDDR5X</span><span>${fmt.bytes(mem.kvDev)} / ${fmt.bytes(mem.kvHost)}</span>` : `<span>Share of KV in LPDDR5X at this batch</span><span>${fmt.pct(mem.hostFrac(dec.ba))}</span>`}` : ''}</div>`,
+    { info: `Weights left after sharding: attention replicates across DP-attn ranks; experts shard across EP. The bar is the static pool (memory fraction × HBM); the rest is left for activations, CUDA graphs and NCCL.${mem.mode !== 'none' ? ' KV offload places part of the KV in the GPU’s share of Grace memory (rows below).' : ''}`, right: `${bigv(fmt.bytes(need))}<span class="muted">of ${fmt.bytes(usable)} usable</span>${over > 0 || dec.oom ? '<span class="pill bad">OOM</span>' : ''}` });
   return `<div class="cpane g22">${breakdown}${roof}${sweep}${memory}</div>`;
 }
 function decodeDetail(S, R) {
@@ -189,7 +194,7 @@ export function sweepsC(S, R) {
     const r = evalDecode(M, H, { ...W, isl: c }, A, P, ba), v = {}; r.segs.filter((s) => !s.hidden).forEach((s) => (v[s.key] = s.ms));
     return { label: ctxLabel(c), v, oom: false, y: mem.bMaxRep, tip: `${ctxLabel(c)} context<br>${fmt.n(mem.bMaxRep, 0)} max concurrent requests<br>TPOT ${fmt.ms(r.tpot)} at batch ${ba}/rank (HBM-saturating)` };
   });
-  const keys = [['attnProj', 'Attn proj'], ['kv', 'Attn core (KV)'], ['dense', 'Dense / shared'], ['moe', 'Experts'], ['glue', 'Glue'], ['comm', 'Comm'], ['pp', 'PP'], ['over', 'Overheads']].map(([key, label]) => ({ key, label, color: COLORS[key] }));
+  const keys = [['attnProj', 'Attn proj'], ['kv', 'Attn core (KV)'], ['dense', 'Dense / shared'], ['moe', 'Experts'], ['glue', 'Glue'], ['host', 'Host KV'], ['comm', 'Comm'], ['pp', 'PP'], ['over', 'Overheads']].map(([key, label]) => ({ key, label, color: COLORS[key] }));
   const ctx = cc('What limits decode as context grows?', stackedColumns({ cols, keys, w: CW, h: 420, xLabel: 'context length (tokens)', line: { label: 'max concurrent requests', pts: cols.map((c) => ({ y: c.y, tip: c.tip || 'does not fit' })) } }), { info: 'Your current layout, batch set to whatever saturates HBM at each context length (independent of the Decode batches slider). Attention / KV eats the step at long context while the batch that fits collapses.' });
 
   const rg = S.regime; let body;

@@ -41,13 +41,14 @@ export function derive(M) {
       const ent = (csaL * csaE + hcaL * hcaE + swaL * win(n)) / L;
       const read = (csaL * (csaE * entryB + (n / M.csaRatio) * idxB) + hcaL * hcaE * entryB + swaL * win(n) * entryB) / L;
       const idxFl = (csaL / L) * 2 * M.idxHeads * M.idxDim * (n / M.csaRatio);
-      return { store, read, ent, idxFl };
+      const csaMain = (csaL * (n / M.csaRatio) * entryB) / L;                      // compressed CSA entries: what HiSparse-style offload moves to host
+      return { store, read, ent, idxFl, csaMain };
     }
     const per = M.attn === 'mla' ? (M.kvLora + M.rope) * bKV : 2 * Math.max(1, M.kvHeads / tpA) * M.headDim * bKV;   // MLA latent is not sharded by TP
-    return { store: per * n, read: per * n, ent: n, idxFl: 0 };
+    return { store: per * n, read: per * n, ent: n, idxFl: 0, csaMain: 0 };
   };
   return {
-    d, bW, bE, bKV, dispatchB, combineB, attnP, denseP, expertP, moeLayers, denseLayers, sharedP, routedP, routerP, embedP, total, active,
+    d, bW, bE, bKV, dispatchB, combineB, entryB, attnP, denseP, expertP, moeLayers, denseLayers, sharedP, routedP, routerP, embedP, total, active,
     kvTokLayer, kv, kvTok: hyb ? (kv(1e6).store * L) / 1e6 : kvTokLayer * L, hyb, csaL, hcaL, swaL,
     mlaFactor: M.attn === 'mla' ? mhaEquiv / (M.kvLora + M.rope) : hyb ? (mhaEquiv * bKV * 1e6) / kv(1e6).store : null,
     sparsity: M.moe ? M.topK / Math.max(M.experts, 1) : 1,

@@ -183,8 +183,26 @@ function kneePoint(M, H, W, A, cfg, gpus, target, hiBa) {
   return point(hi, rb, cfg, P);
 }
 
-// Decode pool. Returns { point, maxPerGpu, atSlo } (point = knee choice; atSlo = the max-throughput point it was reduced from) or null if the SLO is unreachable.
-export function* autoTuneDecode(M, H, W, A, gpus, { slo, eplb = true, eps = KNEE_EPS } = {}) {
+// KV placement for auto-tune: tune once with KV in HBM only and once with spill-to-LPDDR5X allowed, keep spill only if it raises the best
+// feasible throughput by more than eps (it costs host-link traffic and complexity), and only if the chosen batch actually overflows HBM.
+function* runScaled(gen, lo, hi) { let r; while (!(r = gen.next()).done) yield lo + r.value * (hi - lo); return r.value; }
+function choosePlacement(none, spill, score, eps) {
+  if (!spill || (none && score(spill) <= (1 + eps) * score(none))) return none && { res: none, kv: 'none' };
+  return { res: spill, kv: 'spill' };
+}
+const overflowsHbm = (M, H, W, A, p) => p.ba > memoryPerGpu(M, H, { ...W, kvOffload: 'none' }, A, p.P, p.P.D).perRankMax;
+
+// Decode pool. Returns { point, maxPerGpu, atSlo, kvOffload, kvGain } (point = knee choice; atSlo = the max-throughput point it was reduced from;
+// point.kv = the KV placement to apply) or null if the SLO is unreachable.
+export function* autoTuneDecode(M, H, W, A, gpus, opts = {}) {
+  const eps = opts.eps ?? KNEE_EPS;
+  const none = yield* runScaled(autoTuneDecodeAt(M, H, { ...W, kvOffload: 'none' }, A, gpus, opts), 0, 0.5);
+  const spill = yield* runScaled(autoTuneDecodeAt(M, H, { ...W, kvOffload: 'spill' }, A, gpus, opts), 0.5, 1);
+  const c = choosePlacement(none, spill, (r) => r.maxPerGpu, eps); if (!c) return null;
+  const kv = c.kv === 'spill' && overflowsHbm(M, H, { ...W, kvOffload: 'spill' }, A, c.res.point) ? 'spill' : 'none';
+  return { ...c.res, point: { ...c.res.point, kv }, kvOffload: kv, kvGain: none && spill ? spill.maxPerGpu / none.maxPerGpu : null };
+}
+function* autoTuneDecodeAt(M, H, W, A, gpus, { slo, eplb = true, eps = KNEE_EPS } = {}) {
   const cfgs = enumerateConfigs(M, gpus, [false, true], [eplb]), best = [];
   for (let i = 0; i < cfgs.length; i++) {
     const p = bestAtSlo(M, H, W, A, cfgs[i], gpus, slo); if (p) best.push(p);
@@ -211,7 +229,16 @@ export function autoTunePrefill(M, H, W, A, gpus, budget, eps = KNEE_EPS) {
 }
 
 // Split rack: best rate-matched split, then within eps of its goodput the split whose decode side has the highest tokens/s/user (decode batch cut to the knee).
-export function* autoTuneSplit(M, H, W, A, { eplb = true, eps = KNEE_EPS, sizes } = {}) {
+// The decode pool's KV placement is chosen the same way as in autoTuneDecode. row.dec.kv = the placement to apply.
+export function* autoTuneSplit(M, H, W, A, opts = {}) {
+  const eps = opts.eps ?? KNEE_EPS;
+  const none = yield* runScaled(autoTuneSplitAt(M, H, { ...W, kvOffload: 'none' }, A, opts), 0, 0.5);
+  const spill = yield* runScaled(autoTuneSplitAt(M, H, { ...W, kvOffload: 'spill' }, A, opts), 0.5, 1);
+  const c = choosePlacement(none, spill, (r) => r.maxGoodput, eps); if (!c) return null;
+  const kv = c.kv === 'spill' && overflowsHbm(M, H, { ...W, kvOffload: 'spill' }, A, c.res.row.dec) ? 'spill' : 'none';
+  return { ...c.res, row: { ...c.res.row, dec: { ...c.res.row.dec, kv } }, kvOffload: kv };
+}
+function* autoTuneSplitAt(M, H, W, A, { eplb = true, eps = KNEE_EPS, sizes } = {}) {
   const rows = yield* optimizeSplit(M, H, W, A, { eplb, sizes });
   if (!rows.length) return null;
   const tau = (1 - eps) * rows[0].goodput; let chosen = null;

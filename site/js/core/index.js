@@ -2,7 +2,7 @@
 export * from './data.js';
 export { derive } from './model.js';
 export { divisors, poolGpus, layoutOptions, normalize, expertSlots } from './layout.js';
-export { memoryPerGpu } from './memory.js';
+export { memoryPerGpu, hostBw, offloadMode } from './memory.js';
 export { evalDecode, moeLoad } from './decode.js';
 export { evalPrefill } from './prefill.js';
 export { decodeAttention, prefillAttention, attnMathDtype } from './attention.js';

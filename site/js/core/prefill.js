@@ -4,6 +4,7 @@ import { collective, distinctDest } from './comm.js';
 import { moeLoad } from './decode.js';
 import { gemmEta as eta } from './gemm.js';
 import { prefillAttention } from './attention.js';
+import { hostBw } from './memory.js';
 
 // One layer of one kind for a forward pass per attention rank of `nReq` requests, each contributing `size` new tokens on top of `prior`
 // tokens already in its KV cache (nReq > 1 only when several short prompts are packed into one chunk, so prior is then 0).
@@ -35,21 +36,28 @@ function layerChunk(kind, size, prior, M, H, A, P, nReq = 1) {
 
 export function evalPrefill(M, H, W, A, P, gpus, recvSenders) {
   const D = P.D, L = M.layers, Ls = Math.ceil(L / P.pp);
-  const isl = Math.max(W.isl, 1);                                              // no prefix cache: the whole prompt is prefilled
-  const C = Math.max(1, Math.min(W.chunk, isl));                               // tokens of one request per attention rank per iteration
-  const pack = Math.max(1, Math.floor(W.chunk / isl));                         // prompts shorter than the chunk are packed into one forward pass
+  const isl = Math.max(W.isl, 1);
+  // Prefix cache: the first `cached` tokens already have KV in a cache tier; only the rest is computed (attending over the whole prefix).
+  const hit = Math.min(Math.max(W.prefixHit || 0, 0), 0.99), cached = Math.floor(hit * isl), fresh = isl - cached;
+  const C = Math.max(1, Math.min(W.chunk, fresh));                             // tokens of one request per attention rank per iteration
+  const pack = Math.max(1, Math.floor(W.chunk / fresh));                       // prompts shorter than the chunk are packed into one forward pass
   const kinds = [];
   if (D.moeLayers > 0) kinds.push(['moe', D.moeLayers / L]);
   if (D.denseLayers > 0) kinds.push(['dense', D.denseLayers / L]);
   const acc = { tProj: 0, tAttn: 0, tDense: 0, tExp: 0, tGlue: 0, tm: 0, hidden: 0, t: 0 };
-  let nCh = 0, done = 0, tMax = 0;
+  let nCh = 0, done = cached, tMax = 0;
   while (done < isl - 1e-9) {
     const size = Math.min(C, isl - done);
     let ts = 0;
     for (const [k, w] of kinds) { const r = layerChunk(k, size, done, M, H, A, P, pack); for (const key in acc) acc[key] += r[key] * w * Ls; ts += r.t * w * Ls; }
     tMax = Math.max(tMax, ts); done += size; nCh++;
   }
-  const T = acc.t;                                                             // stage-seconds to prefill `pack` requests per attention rank
+  const Tc = acc.t;                                                            // stage-seconds of compute to prefill `pack` requests per attention rank
+  // Cached prefix KV loads into HBM layer by layer while earlier layers compute (HiCache / KVBM style); only the first layer's load is exposed
+  // for sure, the rest hides unless the load is slower than the compute.
+  const tierBw = W.prefixTier === 'storage' ? A.storageGBs * 1e9 : hostBw(H, A);
+  const loadB = cached > 0 ? pack * D.kv(cached, P.tpA).store * Ls / P.cp : 0, tLoad = loadB / tierBw;
+  const T = cached > 0 ? Math.max(Tc, tLoad) + tLoad / Ls : Tc;
   const hop = P.pp > 1 ? collective('p2p', pack * C * M.hidden * 2 * (M.hcMult || 1) / (P.tpA * P.cp), 2, H, A) : 0;
   const tAvg = T / nCh, fill = (P.pp - 1) * tAvg + P.pp * hop;
   const tPrefill = T + fill;                                                   // latency of one request through the pipeline
@@ -65,10 +73,13 @@ export function evalPrefill(M, H, W, A, P, gpus, recvSenders) {
     { key: 'moe', label: 'Routed experts', ms: acc.tExp * scale },
     { key: 'kv', label: 'Attention (quadratic)', ms: acc.tAttn * scale },
     { key: 'glue', label: 'Glue kernels (norm / quant / residual)', ms: acc.tGlue * scale },
+    { key: 'host', label: `Prefix KV load from ${W.prefixTier === 'storage' ? 'storage' : 'Grace memory'} (exposed)`, ms: (T - Tc) * scale },
     { key: 'comm', label: 'Communication (exposed)', ms: (acc.tm - acc.hidden) * scale },
     { key: 'hidden', label: 'Communication (hidden by overlap)', ms: acc.hidden * scale, hidden: true },
     { key: 'pp', label: 'PP fill / drain', ms: fill * scale },
     { key: 'over', label: 'Kernel floors', ms: A.floorUs * 1e-6 * Ls * nCh * scale },
   ].filter((s) => s.ms > 1e-6);
-  return { tPrefill, tChunk: tAvg, nCh, C, pack, bubble, thr, reqPerS, kvBytes, kvXfer, segs, isl, ttft: tPrefill + kvXfer, tLin: acc.tProj + acc.tDense, tExp: acc.tExp, tAttn: acc.tAttn, commT: acc.tm, hidden: acc.hidden };
+  const prefix = { hit, cached, tLoad, tier: W.prefixTier === 'storage' ? 'storage' : 'host', loadGB: loadB / 1e9,
+    ctxPerHostGpu: Math.floor(A.hostGB * 1e9 / Math.max(D.kv(isl, P.tpA).store * Ls / P.cp, 1)) };   // prompts' KV that fit in one GPU's share of Grace memory
+  return { tPrefill, tChunk: tAvg, nCh, C, pack, bubble, thr, prefix, reqPerS, kvBytes, kvXfer, segs, isl, ttft: tPrefill + kvXfer, tLin: acc.tProj + acc.tDense, tExp: acc.tExp, tAttn: acc.tAttn, commT: acc.tm, hidden: acc.hidden };
 }

@@ -1,7 +1,7 @@
 // Decode step model (PLAN §6.1, §6.3, §6.4, §6.6): per-layer op list → roofline times → overlap → pipeline → TPOT.
 // Everything is per GPU, SI units. `ba` = requests per attention rank in one microbatch.
 import { collective, distinctDest } from './comm.js';
-import { memoryPerGpu } from './memory.js';
+import { memoryPerGpu, hostBw } from './memory.js';
 import { gemmEta as eta } from './gemm.js';
 import { decodeAttention } from './attention.js';
 
@@ -19,7 +19,7 @@ export function moeLoad(M, P, b) {
 }
 
 // One layer of a given kind for one (micro)batch: returns op + collective lists and their totals.
-function layerOps(kind, nReq, q, ctx, M, H, W, A, P) {
+function layerOps(kind, nReq, q, ctx, M, H, W, A, P, off) {
   const D = P.D, bw = H.bw * A.hbmEff, tok = nReq * q, ops = [], comm = [];
   const add = (name, cat, fl, by, t, extra) => ops.push({ name, cat, flops: fl, bytes: by, t, ai: fl / Math.max(by, 1), ...extra });
   const peakW = H.flops[M.wDtype];
@@ -27,8 +27,9 @@ function layerOps(kind, nReq, q, ctx, M, H, W, A, P) {
   { const params = D.attnP / P.tpA, fl = 2 * tok * params, by = params * D.bW, tc = fl / (peakW * eta(tok, A.gemmEff, A)), tm = by / bw;
     add('Attn projections', 'attnProj', fl, by, Math.max(tc, tm), { bound: tc > tm ? 'compute' : 'memory' }); }
   // attention core: read the KV cache; absorbed-MLA / GQA / hybrid FLOPs
-  { const a = decodeAttention(nReq, q, ctx, M, H, A, P);
-    add('Attention (KV read)', 'kv', a.flops, a.bytes, a.t, { bound: a.bound }); }
+  { const a = decodeAttention(nReq, q, ctx, M, H, A, P, off);
+    add('Attention (KV read)', 'kv', a.flops, a.bytes, a.t, { bound: a.bound });
+    if (a.hostBytes > 0) add(off.sparse ? 'Host KV swap-in (serial)' : 'Host KV stream (exposed)', 'host', 0, a.hostBytes, a.hostExposed, { bound: 'host link' }); }
   // dense FFN, or shared expert(s) + router in MoE layers
   { const params = (kind === 'moe' ? D.sharedP : D.denseP) / P.tpA + (kind === 'moe' ? D.routerP : 0);      // router is replicated
     if (params > 0) { const fl = 2 * tok * params, by = params * D.bW, tc = fl / (peakW * eta(tok, A.gemmEff, A)), tm = by / bw;
@@ -62,10 +63,10 @@ function layerOps(kind, nReq, q, ctx, M, H, W, A, P) {
 }
 
 // Layer time for one kind: with dual-batch overlap the batch is split in two halves that ping-pong compute and comm.
-function layerTime(kind, nReq, q, ctx, M, H, W, A, P, dbo) {
+function layerTime(kind, nReq, q, ctx, M, H, W, A, P, dbo, off) {
   const floor = A.floorUs * 1e-6 * (dbo ? 2 : 1);
-  if (!dbo) { const r = layerOps(kind, nReq, q, ctx, M, H, W, A, P); return { ...r, t: r.tc + r.tm + floor, hidden: 0, exposed: r.tm, floor }; }
-  const h = layerOps(kind, nReq / 2, q, ctx, M, H, W, A, P), hidden = A.overlap * 2 * Math.min(h.tc, h.tm);
+  if (!dbo) { const r = layerOps(kind, nReq, q, ctx, M, H, W, A, P, off); return { ...r, t: r.tc + r.tm + floor, hidden: 0, exposed: r.tm, floor }; }
+  const h = layerOps(kind, nReq / 2, q, ctx, M, H, W, A, P, off), hidden = A.overlap * 2 * Math.min(h.tc, h.tm);
   const scale = (x) => ({ ...x, flops: (x.flops || 0) * 2, bytes: x.bytes * 2, t: x.t * 2 });             // both halves: weights are re-read per microbatch
   return { ops: h.ops.map(scale), comm: h.comm.map(scale), tc: 2 * h.tc, tm: 2 * h.tm, load: h.load, t: 2 * h.tc + 2 * h.tm - hidden + floor, hidden, exposed: 2 * h.tm - hidden, floor };
 }
@@ -75,6 +76,17 @@ const lmHeadTime = (tok, M, H, A, P, D) => {
   return Math.max(fl / (H.flops[M.wDtype] * eta(b, A.gemmEff, A)), by / (H.bw * A.hbmEff));
 };
 
+// KV offload state for a decode batch (null when everything is in HBM).
+function offloadFor(mem, ba, ctx, M, H, W, A, D) {
+  if (mem.mode === 'none') return null;
+  const hostFrac = mem.hostFrac(ba);
+  if (hostFrac <= 0) return null;                                       // offload only engages once HBM is full
+  const sparse = mem.mode === 'sparse'
+    ? { fetchB: (D.csaL / M.layers) * Math.min(M.idxTopk, ctx / M.csaRatio) * A.sparseMiss * D.entryB * mem.offloadedShare(ba) }   // per request per layer (avg): top-k misses, only offloaded requests swap in
+    : null;
+  return { hostFrac, hostBw: hostBw(H, A), sparse };
+}
+
 export function evalDecode(M, H, W, A, P, ba) {
   const D = P.D, L = M.layers, Ls = Math.ceil(L / P.pp), gamma = W.specGamma || 0, q = gamma + 1;
   const alpha = Math.min(W.specAlpha ?? 0.85, 0.999), E = gamma > 0 ? (1 - Math.pow(alpha, gamma + 1)) / (1 - alpha) : 1;   // expected tokens per verify step
@@ -83,7 +95,8 @@ export function evalDecode(M, H, W, A, P, ba) {
   const kinds = [];
   if (D.moeLayers > 0) kinds.push(['moe', D.moeLayers / L]);
   if (D.denseLayers > 0) kinds.push(['dense', D.denseLayers / L]);
-  const per = kinds.map(([k, w]) => ({ k, w, r: layerTime(k, ba, q, ctx, M, H, W, A, P, dbo) }));
+  const mem = memoryPerGpu(M, H, W, A, P, D), off = offloadFor(mem, ba, ctx, M, H, W, A, D);
+  const per = kinds.map(([k, w]) => ({ k, w, r: layerTime(k, ba, q, ctx, M, H, W, A, P, dbo, off) }));
 
   // merge the per-kind op lists into one layer-average list (what the UI table / roofline show)
   const byName = new Map(), commBy = new Map();
@@ -103,13 +116,13 @@ export function evalDecode(M, H, W, A, P, ba) {
   const tok = ba * q, hop = P.pp > 1 ? collective('p2p', tok * M.hidden * 2 * (M.hcMult || 1) / (P.tpA * P.cp), 2, H, A) : 0;
   const m = P.microbatches, f = Math.max(m, P.pp);
   let draft = 0;                                                            // MTP / draft layer, run γ times sequentially on 1 token per request
-  if (gamma > 0) { const kd = D.moeLayers > 0 ? 'moe' : 'dense'; draft = gamma * (layerTime(kd, ba, 1, ctx, M, H, W, A, P, dbo).t + lmHeadTime(ba, M, H, A, P, D)); }
+  if (gamma > 0) { const kd = D.moeLayers > 0 ? 'moe' : 'dense'; draft = gamma * (layerTime(kd, ba, 1, ctx, M, H, W, A, P, dbo, off).t + lmHeadTime(ba, M, H, A, P, D)); }
   const step = f * tStage + P.pp * hop + A.overheadMs * 1e-3 + draft;    // seconds per verify step
   const tpot = step / E;                                                    // effective seconds per output token per user
   const b = ba * P.dpA, thrRep = m * b * E / step, total = thrRep * P.replicas, perGpu = total / P.gpus;
 
   // step-time breakdown per emitted token (ms). Time inside f·t_stage is scaled by m; the (f − m) idle stage-slots are pipeline bubbles.
-  const cats = { attnProj: 0, kv: 0, dense: 0, moe: 0, glue: 0 };
+  const cats = { attnProj: 0, kv: 0, dense: 0, moe: 0, glue: 0, host: 0 };
   ops.forEach((o) => { cats[o.cat] += o.t * Ls * m / E; });
   const ms = 1e3;
   const segs = [
@@ -118,17 +131,17 @@ export function evalDecode(M, H, W, A, P, ba) {
     { key: 'dense', label: 'Dense / shared FFN', ms: cats.dense * ms },
     { key: 'moe', label: 'Routed experts', ms: cats.moe * ms },
     { key: 'glue', label: 'Glue kernels (norm / quant / residual)', ms: cats.glue * ms },
+    { key: 'host', label: off?.sparse ? 'Host KV swap-in (Grace)' : 'Host KV stream (Grace, exposed)', ms: cats.host * ms },
     { key: 'comm', label: 'Communication (exposed)', ms: exposed * Ls * m / E * ms },
     { key: 'hidden', label: 'Communication (hidden by overlap)', ms: hidden * Ls * m / E * ms, hidden: true },
     { key: 'pp', label: 'PP hops + bubbles', ms: ((f - m) * tStage + P.pp * hop) / E * ms },
     { key: 'spec', label: 'Speculation (draft steps)', ms: draft / E * ms },
     { key: 'over', label: 'Framework + kernel floors', ms: ((A.overheadMs * 1e-3) / E + (floor * Ls + tLm) * m / E) * ms },
   ].filter((s) => s.ms > 1e-6);
-  const mem = memoryPerGpu(M, H, W, A, P, D);
-  const oom = mem.kvUsedFor(ba) > mem.free;
+  const oom = mem.oomAt(ba);
   return {
     tpot, tokUser: 1 / tpot, total, perGpu, b, ba, ops, comm, segs, imb: load.imb, touched: load.touched, tokLoc: load.tokLoc, exposed, hidden, commT, tStage, tLayer, mem, oom,
-    stepMs: step * 1e3, E, concurrency: m * b * P.replicas,
+    stepMs: step * 1e3, E, concurrency: m * b * P.replicas, offload: off ? { mode: mem.mode, hostFrac: off.hostFrac, hostGB: mem.hostUsedFor(ba) / 1e9, offloaded: mem.offloadedFor(ba) } : null,
     bottleneck: bottleneck(segs, ops, mem, oom, M),
   };
 }
@@ -136,7 +149,8 @@ export function evalDecode(M, H, W, A, P, ba) {
 const gb = (x) => (x / 1e9).toFixed(0) + ' GB';
 function bottleneck(segs, ops, mem, oom, M) {
   if (mem.free <= 0) return { kind: 'capacity', text: `Weights alone don’t fit: ${gb(mem.wAttn + mem.wExp + mem.wEmb)} per GPU (attention ${gb(mem.wAttn)}, experts ${gb(mem.wExp)}) against ${gb(mem.hbm)} of HBM. Use fewer redundant expert slots, a larger EP/PP, or FP4 experts.` };
-  if (oom) return { kind: 'capacity', text: `Out of memory: KV for this batch needs more than the ${gb(mem.free)} free per GPU. Lower the batch, raise DP-attn / CP, or use FP8 KV.` };
+  if (oom) return { kind: 'capacity', text: mem.mode === 'none' ? `Out of memory: KV for this batch needs more than the ${gb(mem.free)} free per GPU. Lower the batch, raise DP-attn / CP, use FP8 KV, or offload KV to Grace memory.`
+    : `Out of memory: KV for this batch needs more than ${gb(mem.free)} of HBM plus ${gb(mem.hostCap)} of Grace memory per GPU. Lower the batch or raise DP-attn / CP.` };
   const vis = segs.filter((s) => !s.hidden), total = vis.reduce((a, s) => a + s.ms, 0), top = [...vis].sort((a, b) => b.ms - a.ms)[0];
   const pct = Math.round((top.ms / total) * 100);
   const bound = top.key === 'kv' ? ops.find((o) => o.cat === 'kv')?.bound : top.key === 'moe' ? ops.find((o) => o.cat === 'moe')?.bound : null;
@@ -144,6 +158,7 @@ function bottleneck(segs, ops, mem, oom, M) {
     kv: `Attention over the KV cache dominates (${pct}% of the step, ${bound}-bound). More CP/TP shards KV reads; a smaller batch or FP8 KV cuts them.`,
     moe: `Routed experts dominate (${pct}%, ${bound}-bound). ${bound === 'compute' ? 'Experts are past the ridge point: more EP won’t add throughput, only FP4 weights or a smaller batch help.' : 'Expert weights are re-read each step: raise the batch or widen EP so each expert sees more tokens.'}`,
     attnProj: `Attention projections dominate (${pct}%). Weights are replicated per DP-attn rank: increase TP or shrink DP to spread them.`,
+    host: `Moving KV over NVLink-C2C from Grace memory dominates (${pct}%): the host link is ~35× slower than HBM. ${M.attn === 'hybrid' ? 'Enlarge the hot buffer or lower the batch.' : 'Dense attention reads every KV byte every step, so spilling only pays when weights dominate the step; lower the batch or add GPUs.'}`,
     glue: `Memory-bound glue kernels (norms, quantization, residual adds, MoE combine) dominate (${pct}%): kernel fusion is the lever, not parallelism.`,
     dense: `Dense / shared FFN dominates (${pct}%). Increase TP to multiply bandwidth for these layers.`,
     comm: `Exposed communication dominates (${pct}%). Try dual-batch overlap, fewer TP ranks, or FP8 dispatch.`,

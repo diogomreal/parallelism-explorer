@@ -1,7 +1,10 @@
 export const DT_BYTES = { bf16: 2, fp8: 1, fp4: 0.5625 };
 
 export const HARDWARE = {
-  gb200: { name: 'GB200 NVL72', gpus: 72, hbmGB: 186, bw: 8e12, flops: { bf16: 2.5e15, fp8: 5e15, fp4: 10e15 }, link: 900e9, sfu: 16 * 148 * 2.06e9, tdpW: 1200, nic: 50e9, provenance: 'vendor / verify' },
+  gb200: { name: 'GB200 NVL72', gpus: 72, hbmGB: 186, bw: 8e12, flops: { bf16: 2.5e15, fp8: 5e15, fp4: 10e15 }, link: 900e9, sfu: 16 * 148 * 2.06e9, tdpW: 1200,
+    // Grace host tier: one Grace per 2 GPUs, 480 GB LPDDR5X at ~512 GB/s; NVLink-C2C 450 GB/s each way. Whether C2C is per GPU or per superchip is not
+    // documented publicly; either way two GPUs streaming at once share the LPDDR5X, so per-GPU peak = min(C2C, LPDDR5X) / 2.
+    host: { gbPerGrace: 480, gpusPerGrace: 2, lpddrBw: 512e9, c2c: 450e9 }, nic: 50e9, provenance: 'vendor / verify' },
 };
 
 // DeepSeek-V4 numbers: HF config.json (deepseek-ai/DeepSeek-V4-Pro, -Flash), checked 2026-09-23: dims, index_topk, o_groups / o_lora_rank and the
@@ -22,7 +25,13 @@ export const MODELS = {
 
 export const HYBRID_DEFAULT = { headDim: 512, kvHeads: 1, ropeDim: 64, qLora: 1024, oGroups: 8, oLora: 1024, csaRatio: 4, hcaRatio: 128, window: 128, idxTopk: 512, idxHeads: 64, idxDim: 128 };
 // gpuHr: $/GPU-hour (blank/0 hides all cost figures). specGamma: MTP / draft tokens per step (0 = off); specAlpha: per-token acceptance.
-export const WORKLOAD_DEFAULT = { isl: 2048, osl: 1024, minTokUser: 20, ttftMs: 2000, gpuHr: 3.5, batchPerRank: 384, chunk: 8192, specGamma: 0, specAlpha: 0.85 };
+// KV offload (see docs/validation.md "KV offload"):
+//   prefixHit: share of each prompt whose KV is already cached (0 = no prefix cache); prefixTier: where hits are loaded from ('host' Grace memory | 'storage').
+//   kvOffload: decode KV placement. 'none' = HBM only; 'spill' = once HBM is full, KV moves to Grace LPDDR5X. How depends on the attention:
+//   dense attention streams the spilled KV every step; sparse (CSA) attention keeps the CSA entries in LPDDR5X and swaps in each step's top-k
+//   misses into a per-request HBM hot buffer (SGLang HiSparse). Auto-tune picks the placement.
+export const WORKLOAD_DEFAULT = { isl: 2048, osl: 1024, minTokUser: 20, ttftMs: 2000, gpuHr: 3.5, batchPerRank: 384, chunk: 8192, specGamma: 0, specAlpha: 0.85,
+  prefixHit: 0, prefixTier: 'host', kvOffload: 'none' };
 // Every constant below is an assumption (provenance 'assumed') until calibrated against measurements; see docs/validation.md.
 export const ASSUMP_DEFAULT = {
   // gemmEff, moeEff, attnEff: fitted by scripts/calibrate.mjs (npm run calibrate) to the anchors in tests/anchors.data.mjs, with priors
@@ -44,6 +53,11 @@ export const ASSUMP_DEFAULT = {
   linkEff: 0.7,      // achievable fraction of NVLink bandwidth for all-to-all / p2p
   glueHid: 8,        // memory-bound "glue" passes over the BF16 hidden vector per token per layer (fused add+RMSNorm ×2, activation quant, RoPE, residual): ~8 with fused norms
   glueExp: 2,        // extra hidden-vector passes per routed (token, expert) assignment: FC2 output write + combine/weighted-sum read
-  gemmTileM: 64,     // GEMM rows are padded to whole tiles of this many rows (tile quantization on the token dimension)
+  gemmTileM: 64,
+  hostGB: 200,       // Grace memory per GPU available for KV (480 GB per Grace, 2 GPUs, minus OS, runtime and pinned staging)
+  hostBwEff: 0.8,    // achieved fraction of the per-GPU host bandwidth (GH200 nvbandwidth: host→device 416 of 450 GB/s, device→host 295)
+  storageGBs: 25,    // per-GPU bandwidth of the storage tier for prefix-cache hits (NIC / NVMe / 3FS-class), GB/s
+  sparseBuf: 4096,   // sparse-attention spill: HBM hot-buffer entries per request per CSA layer (HiSparse device_buffer_size: 2048–6144)
+  sparseMiss: 0.1,   // sparse-attention spill: share of each step's top-k not already in the hot buffer (assumed; FreeKV: > 80% step-to-step overlap)     // GEMM rows are padded to whole tiles of this many rows (tile quantization on the token dimension)
 };
 

@@ -72,7 +72,35 @@ speculative decoding helps at small batch and fades at large batch; CP shards KV
 - **Speculative decoding (MTP).** Verify step processes γ+1 tokens per request (raising expert touch), drafts run γ layer-steps, `E = (1 − α^(γ+1)) / (1 − α)`.
 - **DeepSeek-V4.** Dimensions, `index_topk` (Pro 1024, Flash 512) and the per-layer schedule come from HF `config.json` `compress_ratios`: Pro has 30 CSA + 31 HCA layers, Flash 21 CSA + 20 HCA + 2 layers with ratio 0, which we **assume** are sliding-window only. The FP8/BF16 KV entry layout is **assumed**. No anchor covers V4, so 200K–1M results are extrapolation. The four mHC residual streams only enter through the 4× wider pipeline hop; hash-routed layers are costed as ordinary MoE layers.
 
+## KV offload (Grace memory and storage)
+
+What deployments actually do, and what the tool models (`memory.js`, `attention.js`, `prefill.js`).
+
+**Controls.**
+- Prefix cache: Workload → Prefix cache.
+- Decode KV placement: Parallelism card → KV cache, shown while editing a decode pool. The two options are *HBM only* and *Spill to LPDDR5X when HBM is full*.
+- Assumptions: Grace LPDDR5X per GPU and host link efficiency; for sparse-attention models, the hot-buffer size and miss rate.
+- Auto-tune picks the placement itself. It tunes once per option and keeps spill only if spill raises the best feasible throughput (goodput for a split rack) by more than 2% and the chosen batch actually overflows HBM.
+
+| Mechanism | In production? | Tool behaviour |
+|---|---|---|
+| **Prefix / context cache** in host memory or storage | Yes, widely: SGLang HiCache (GPU → host → 3FS / Mooncake / NIXL), NVIDIA Dynamo KVBM (G1 GPU → G2 CPU → G3 disk → G4 remote), Mooncake, LMCache | The cached share of the prompt skips prefill compute; new tokens still attend over it. Its KV loads layer by layer at the tier's bandwidth, overlapped with compute: stage time = max(compute, load) + one layer's load. Prefill throughput counts the whole prompt. |
+| **Spill, sparse (CSA) attention** | Yes: SGLang HiSparse (`--enable-hisparse`, DeepSeek-V3.2, GLM-5, DeepSeek-V4; decode instances; LRU hot buffer 2–6K slots) | **Minimal spill.** Once HBM is full, only as many requests as needed move their CSA compressed entries to LPDDR5X. Each such request keeps indexer keys, HCA, window and a hot buffer in HBM, and every other request stays fully in HBM. Offloaded requests swap in their top-k misses **serially** each step, because the misses depend on this step's indexer output. HiSparse itself mirrors *every* request in host memory: offloading only the overflow is our extension. It keeps HBM full when LPDDR5X is the binding capacity (V4-Pro at 624K on DEP72: 74 → 95 requests/rank, +12.5% auto-tuned throughput). |
+| **Spill, dense attention** | No production stack streams dense-attention KV from host each step; research systems (FlexGen, InfiniGen) do | KV that doesn't fit in HBM moves to LPDDR5X and is **streamed every step**, prefetched and overlapped with the HBM part of attention. Auto-tune rejects it wherever it doesn't pay. |
+| Weight offload | LMSYS GB200 Part II "Scaling Down by Offloading" (prefill weights, prefetched) | Not modeled yet: this is why the FP8-MoE 4-GPU prefill anchor is "needs feature". |
+
+Hardware (`HARDWARE.gb200.host`): 480 GB LPDDR5X per Grace at ~512 GB/s, shared by 2 GPUs; NVLink-C2C 450 GB/s each way.
+Public docs don't say whether C2C is per GPU or per superchip. Two GPUs streaming at once share the LPDDR5X either way, so the per-GPU peak is taken as min(C2C, LPDDR5X) / 2 = 225 GB/s,
+times `hostBwEff` 0.8 (GH200 nvbandwidth measures host→device at 416 of 450 GB/s). `hostGB` = 200 GB per GPU after OS, runtime and pinned buffers.
+
+Checks (`tests/offload.test.mjs`):
+- HiSparse trend: V4-Flash at 200K/20K on 2 GPUs gains 2.77× throughput at the capacity-limited batch, against "up to 3×" reported on 2×B200.
+- Dense spill lowers throughput for V3 at 128K even though it doubles concurrency.
+- A prefix load from Grace memory hides behind compute, but a slow storage tier can become the bottleneck.
+
+Not modeled: the working-set size and hit rate of the prefix cache (the user sets the hit rate; the tool reports how many prompts' KV fit in Grace memory), eviction dynamics, and HiSparse's miss rate as a function of buffer size.
+
 ## Not implemented yet (PLAN milestones M6+)
 
-Aggregated / chunked-prefill-with-decode mode (removed from the product for now), KV offload to Grace, attention-FFN disaggregation, DWDP, discrete-event tails, HF `config.json` import,
+Aggregated / chunked-prefill-with-decode mode (removed from the product for now), weight offload to Grace, attention-FFN disaggregation, DWDP, discrete-event tails, HF `config.json` import,
 calibration mode (fit efficiency knobs to user measurements), sensitivity tornado, other hardware, launch-command export. Uneven pipeline stage assignment is approximated.
